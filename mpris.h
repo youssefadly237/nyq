@@ -8,7 +8,9 @@
 
 int mpris_oneshot_status(const char *name);
 int mpris_oneshot_play_pause(const char *name);
-int mpris_oneshot_next(const char *name);
-int mpris_oneshot_previous(const char *name);
+int mpris_oneshot_track_next(const char *name);
+int mpris_oneshot_track_prev(const char *name);
 int mpris_oneshot_vol_up(const char *name);
 int mpris_oneshot_vol_down(const char *name);
+int mpris_oneshot_cycle_next(void);
+int mpris_oneshot_cycle_prev(void);

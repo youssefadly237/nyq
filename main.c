@@ -18,17 +18,21 @@ static void usage(void) {
         "\n"
         "sink commands:\n"
         "  sink-status\n"
-        "  sink-raise\n"
-        "  sink-lower\n"
+        "  sink-vol-up\n"
+        "  sink-vol-down\n"
         "  sink-mute\n"
+        "  sink-next\n"
+        "  sink-prev\n"
         "\n"
         "player commands (NAME is optional partial match):\n"
-        "  player-status     [NAME]\n"
-        "  player-play-pause [NAME]\n"
-        "  player-next       [NAME]\n"
-        "  player-previous   [NAME]\n"
-        "  player-vol-up     [NAME]\n"
-        "  player-vol-down   [NAME]\n"
+        "  player-status      [NAME]\n"
+        "  player-play-pause  [NAME]\n"
+        "  player-vol-up      [NAME]\n"
+        "  player-vol-down    [NAME]\n"
+        "  player-track-next  [NAME]\n"
+        "  player-track-prev  [NAME]\n"
+        "  player-cycle-next\n"
+        "  player-cycle-prev\n"
     );
 }
 
@@ -67,18 +71,22 @@ int main(int argc, char *argv[]) {
     if (strcmp(cmd, "listen") == 0) return cmd_listen(argc, argv);
 
     /* sink */
-    if (strcmp(cmd, "sink-status") == 0) return pw_oneshot_status();
-    if (strcmp(cmd, "sink-raise")  == 0) return pw_oneshot_raise();
-    if (strcmp(cmd, "sink-lower")  == 0) return pw_oneshot_lower();
-    if (strcmp(cmd, "sink-mute")   == 0) return pw_oneshot_mute();
+    if (strcmp(cmd, "sink-status")   == 0) return pw_oneshot_status();
+    if (strcmp(cmd, "sink-vol-up")   == 0) return pw_oneshot_vol_up();
+    if (strcmp(cmd, "sink-vol-down") == 0) return pw_oneshot_vol_down();
+    if (strcmp(cmd, "sink-mute")     == 0) return pw_oneshot_mute();
+    if (strcmp(cmd, "sink-next")     == 0) return pw_oneshot_sink_next();
+    if (strcmp(cmd, "sink-prev")     == 0) return pw_oneshot_sink_prev();
 
     /* player */
-    if (strcmp(cmd, "player-status")     == 0) return mpris_oneshot_status(name);
-    if (strcmp(cmd, "player-play-pause") == 0) return mpris_oneshot_play_pause(name);
-    if (strcmp(cmd, "player-next")       == 0) return mpris_oneshot_next(name);
-    if (strcmp(cmd, "player-previous")   == 0) return mpris_oneshot_previous(name);
-    if (strcmp(cmd, "player-vol-up")     == 0) return mpris_oneshot_vol_up(name);
-    if (strcmp(cmd, "player-vol-down")   == 0) return mpris_oneshot_vol_down(name);
+    if (strcmp(cmd, "player-status")      == 0) return mpris_oneshot_status(name);
+    if (strcmp(cmd, "player-play-pause")  == 0) return mpris_oneshot_play_pause(name);
+    if (strcmp(cmd, "player-vol-up")      == 0) return mpris_oneshot_vol_up(name);
+    if (strcmp(cmd, "player-vol-down")    == 0) return mpris_oneshot_vol_down(name);
+    if (strcmp(cmd, "player-track-next")  == 0) return mpris_oneshot_track_next(name);
+    if (strcmp(cmd, "player-track-prev")  == 0) return mpris_oneshot_track_prev(name);
+    if (strcmp(cmd, "player-cycle-next")  == 0) return mpris_oneshot_cycle_next();
+    if (strcmp(cmd, "player-cycle-prev")  == 0) return mpris_oneshot_cycle_prev();
 
     fprintf(stderr, "nyq: unknown command: %s\n", cmd);
     usage();

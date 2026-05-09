@@ -2,6 +2,7 @@
 #include "util.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -13,15 +14,35 @@
 #include <spa/utils/result.h>
 
 /* ------------------------------------------------------------------ */
+/* Sink list for cycling                                                 */
+/* ------------------------------------------------------------------ */
+
+#define MAX_SINKS 32
+
+typedef struct {
+    uint32_t id;
+    char     name[256];
+} SinkEntry;
+
+/* ------------------------------------------------------------------ */
 /* State shared across callbacks                                        */
 /* ------------------------------------------------------------------ */
 
 typedef enum {
-    PHASE_WAIT_GLOBALS,   /* waiting for initial registry burst */
-    PHASE_WAIT_BIND,      /* waiting for metadata + node to bind */
-    PHASE_WAIT_PARAMS,    /* waiting for Props param */
+    PHASE_WAIT_GLOBALS,
+    PHASE_WAIT_BIND,
+    PHASE_WAIT_PARAMS,
     PHASE_DONE,
 } Phase;
+
+typedef enum {
+    PW_CMD_STATUS,
+    PW_CMD_VOL_UP,
+    PW_CMD_VOL_DOWN,
+    PW_CMD_MUTE,
+    PW_CMD_SINK_NEXT,
+    PW_CMD_SINK_PREV,
+} PwCmd;
 
 typedef struct {
     struct pw_main_loop    *loop;
@@ -37,19 +58,20 @@ typedef struct {
     struct pw_metadata     *metadata;
     struct pw_node         *node;
 
-    /* node id we are targeting */
+    /* all known sinks */
+    SinkEntry               sinks[MAX_SINKS];
+    int                     n_sinks;
+
+    /* current default sink */
     uint32_t                target_id;
     char                    target_name[256];
 
     /* current state read from Props */
-    float                   level;      /* perceptual 0.0-1.0 */
+    float                   level;
     bool                    muted;
     uint32_t                n_channels;
 
-    /* what to do after reading current state */
-    int                     delta;      /* +5 / -5 / 0 for status */
-    bool                    do_mute_toggle;
-
+    PwCmd                   cmd;
     int                     sync_seq;
     Phase                   phase;
     int                     error;
@@ -114,10 +136,7 @@ static int on_metadata_property(void *data, uint32_t subject,
     if (!key || !value)        return 0;
     if (strcmp(key, "default.audio.sink") != 0) return 0;
 
-    if (parse_name_json(value, s->target_name, sizeof(s->target_name)) < 0) {
-        fprintf(stderr, "nyq: failed to parse default sink name from: %s\n",
-                value);
-    }
+    parse_name_json(value, s->target_name, sizeof(s->target_name));
     return 0;
 }
 
@@ -191,8 +210,15 @@ static void on_global(void *data, uint32_t id, uint32_t permissions,
         if (!media_class || !node_name) return;
         if (strcmp(media_class, "Audio/Sink") != 0) return;
 
-        /* store all sink candidates — we pick the right one in start_bind
-         * once we know target_name from metadata */
+        /* store in sink list */
+        if (s->n_sinks < MAX_SINKS) {
+            s->sinks[s->n_sinks].id = id;
+            snprintf(s->sinks[s->n_sinks].name,
+                     sizeof(s->sinks[s->n_sinks].name), "%s", node_name);
+            s->n_sinks++;
+        }
+
+        /* track best candidate for default */
         if (s->target_id == 0 ||
             (s->target_name[0] != '\0' &&
              strcmp(node_name, s->target_name) == 0)) {
@@ -227,6 +253,13 @@ static void start_bind(PwState *s) {
         pw_main_loop_quit(s->loop);
         return;
     }
+
+    /* sink-next / sink-prev don't need to bind a node */
+    if (s->cmd == PW_CMD_SINK_NEXT || s->cmd == PW_CMD_SINK_PREV) {
+        finish(s);
+        return;
+    }
+
     if (s->target_id == 0) {
         fprintf(stderr, "nyq: no audio sink found\n");
         s->error = -1;
@@ -234,27 +267,117 @@ static void start_bind(PwState *s) {
         return;
     }
 
-    /* bind the node we identified */
     s->node = pw_registry_bind(s->registry, s->target_id,
                   PW_TYPE_INTERFACE_Node, PW_VERSION_NODE,
                   sizeof(PwState *));
     pw_node_add_listener(s->node, &s->node_listener, &node_events, s);
-
-    /* sync again to wait for the bind to complete */
     s->sync_seq = pw_core_sync(s->core, PW_ID_CORE, 0);
 }
 
 static void start_params(PwState *s) {
-    /* enum Props — will trigger on_node_param */
     uint32_t ids[] = { SPA_PARAM_Props };
     pw_node_subscribe_params(s->node, ids, 1);
     pw_node_enum_params(s->node, 0, SPA_PARAM_Props, 0, 1, NULL);
 }
 
+/* ------------------------------------------------------------------ */
+/* Sink cycling                                                          */
+/* ------------------------------------------------------------------ */
+
+static const char *sink_state_path(void) {
+    static char path[108];
+    if (path[0]) return path;
+    const char *runtime = getenv("XDG_RUNTIME_DIR");
+    if (!runtime) runtime = "/tmp";
+    snprintf(path, sizeof(path), "%s/nyq-sink.state", runtime);
+    return path;
+}
+
+static void sink_state_write(const char *name) {
+    FILE *f = fopen(sink_state_path(), "w");
+    if (!f) return;
+    fprintf(f, "%s\n", name);
+    fclose(f);
+}
+
+static void sink_state_read(char *buf, int len) {
+    buf[0] = '\0';
+    FILE *f = fopen(sink_state_path(), "r");
+    if (!f) return;
+    if (fgets(buf, len, f)) {
+        int l = strlen(buf);
+        if (l > 0 && buf[l-1] == '\n') buf[l-1] = '\0';
+    }
+    fclose(f);
+}
+
+static void do_sink_cycle(PwState *s, int dir) {
+    if (s->n_sinks == 0) {
+        fprintf(stderr, "nyq: no sinks available\n");
+        s->error = -1;
+        pw_main_loop_quit(s->loop);
+        return;
+    }
+
+    /* read last selected sink from state file, fall back to current default */
+    char last[256] = {0};
+    sink_state_read(last, sizeof(last));
+    if (last[0] == '\0')
+        snprintf(last, sizeof(last), "%s", s->target_name);
+
+    /* find last in sink list */
+    int cur = 0;
+    for (int i = 0; i < s->n_sinks; i++) {
+        if (strcmp(s->sinks[i].name, last) == 0) {
+            cur = i;
+            break;
+        }
+    }
+
+    int next = (cur + dir + s->n_sinks) % s->n_sinks;
+    const char *new_name = s->sinks[next].name;
+
+    /* persist selection */
+    sink_state_write(new_name);
+
+    /* set default.audio.sink in metadata */
+    char value[320];
+    snprintf(value, sizeof(value), "{\"name\":\"%s\"}", new_name);
+    pw_metadata_set_property(s->metadata, PW_ID_CORE,
+                             "default.audio.sink",
+                             "Spa:String:JSON", value);
+    pw_metadata_set_property(s->metadata, PW_ID_CORE,
+                             "default.configured.audio.sink",
+                             "Spa:String:JSON", value);
+
+    fprintf(stdout,
+            "{\"type\":\"sink-switch\",\"name\":\"%s\"}\n", new_name);
+    fflush(stdout);
+
+    s->phase = PHASE_DONE;
+    pw_main_loop_quit(s->loop);
+}
+
+/* ------------------------------------------------------------------ */
+/* Finish: apply command and emit result                                 */
+/* ------------------------------------------------------------------ */
+
 static void finish(PwState *s) {
-    if (s->delta != 0) {
-        /* raise or lower */
-        float new_level = volume_step(s->level, s->delta);
+    switch (s->cmd) {
+    case PW_CMD_SINK_NEXT:
+        do_sink_cycle(s, +1);
+        return;
+    case PW_CMD_SINK_PREV:
+        do_sink_cycle(s, -1);
+        return;
+    default:
+        break;
+    }
+
+    /* volume / mute commands — level/muted filled by on_node_param */
+    if (s->cmd == PW_CMD_VOL_UP || s->cmd == PW_CMD_VOL_DOWN) {
+        int delta = (s->cmd == PW_CMD_VOL_UP) ? +5 : -5;
+        float new_level  = volume_step(s->level, delta);
         float new_linear = perceptual_to_linear(new_level);
 
         uint8_t buf[1024];
@@ -271,7 +394,7 @@ static void finish(PwState *s) {
         pw_node_set_param(s->node, SPA_PARAM_Props, 0, param);
         s->level = new_level;
 
-    } else if (s->do_mute_toggle) {
+    } else if (s->cmd == PW_CMD_MUTE) {
         bool new_mute = !s->muted;
         uint8_t buf[256];
         struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
@@ -291,10 +414,9 @@ static void finish(PwState *s) {
 /* Common entry point                                                   */
 /* ------------------------------------------------------------------ */
 
-static int pw_oneshot_run(int delta, bool do_mute_toggle) {
+static int pw_oneshot_run(PwCmd cmd) {
     PwState s = {0};
-    s.delta          = delta;
-    s.do_mute_toggle = do_mute_toggle;
+    s.cmd = cmd;
 
     pw_init(NULL, NULL);
 
@@ -312,13 +434,11 @@ static int pw_oneshot_run(int delta, bool do_mute_toggle) {
     pw_registry_add_listener(s.registry, &s.registry_listener,
                              &registry_events, &s);
 
-    /* first sync: wait for initial globals burst */
     s.phase    = PHASE_WAIT_GLOBALS;
     s.sync_seq = pw_core_sync(s.core, PW_ID_CORE, 0);
 
     pw_main_loop_run(s.loop);
 
-    /* cleanup */
     if (s.node)     { pw_proxy_destroy((struct pw_proxy *)s.node); }
     if (s.metadata) { pw_proxy_destroy((struct pw_proxy *)s.metadata); }
     pw_proxy_destroy((struct pw_proxy *)s.registry);
@@ -334,7 +454,9 @@ static int pw_oneshot_run(int delta, bool do_mute_toggle) {
 /* Public API                                                           */
 /* ------------------------------------------------------------------ */
 
-int pw_oneshot_status(void) { return pw_oneshot_run(0, false); }
-int pw_oneshot_raise(void)  { return pw_oneshot_run(+5, false); }
-int pw_oneshot_lower(void)  { return pw_oneshot_run(-5, false); }
-int pw_oneshot_mute(void)   { return pw_oneshot_run(0, true); }
+int pw_oneshot_status(void)    { return pw_oneshot_run(PW_CMD_STATUS);    }
+int pw_oneshot_vol_up(void)    { return pw_oneshot_run(PW_CMD_VOL_UP);    }
+int pw_oneshot_vol_down(void)  { return pw_oneshot_run(PW_CMD_VOL_DOWN);  }
+int pw_oneshot_mute(void)      { return pw_oneshot_run(PW_CMD_MUTE);      }
+int pw_oneshot_sink_next(void) { return pw_oneshot_run(PW_CMD_SINK_NEXT); }
+int pw_oneshot_sink_prev(void) { return pw_oneshot_run(PW_CMD_SINK_PREV); }
