@@ -6,7 +6,7 @@ LDFLAGS = -lm \
           $(shell pkg-config --libs libpipewire-0.3 libcjson) \
           -lsystemd
 
-SRC = main.c util.c pw.c mpris.c
+SRC = main.c util.c pw.c mpris.c sock.c
 OBJ = $(SRC:.c=.o)
 BIN = nyq
 
