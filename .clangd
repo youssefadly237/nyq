@@ -1,3 +1,9 @@
 CompileFlags:
   Add:
+    - -D_GNU_SOURCE
     - -I/usr/include/cjson
+    - -I/usr/include/pipewire-0.3
+    - -I/usr/include/spa-0.2
+    - -D_REENTRANT
+    - -fno-strict-aliasing
+    - -fno-strict-overflow
