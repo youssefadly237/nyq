@@ -17,10 +17,12 @@
 static const char *sock_path(void) {
     /* sun_path is 108 bytes on Linux — cap path to fit */
     static char path[108];
-    if (path[0]) return path;
+    if (path[0])
+        return path;
 
     const char *runtime = getenv("XDG_RUNTIME_DIR");
-    if (!runtime) runtime = "/tmp";
+    if (!runtime)
+        runtime = "/tmp";
     snprintf(path, sizeof(path), "%s/nyq.sock", runtime);
     return path;
 }
@@ -106,8 +108,9 @@ int sock_client_connect(void) {
     memcpy(addr.sun_path, sock_path(), sizeof(addr.sun_path));
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "nyq: cannot connect to daemon at %s: %s\n"
-                        "nyq: is 'nyq daemon' running?\n",
+        fprintf(stderr,
+                "nyq: cannot connect to daemon at %s: %s\n"
+                "nyq: is 'nyq daemon' running?\n",
                 sock_path(), strerror(errno));
         close(fd);
         return -1;
@@ -116,15 +119,15 @@ int sock_client_connect(void) {
     return fd;
 }
 
-void sock_client_listen(int fd, const char *type_filter,
-                        const char *player_filter) {
+void sock_client_listen(int fd, const char *type_filter, const char *player_filter) {
     char buf[2048];
     char line[2048];
-    int  line_len = 0;
+    int line_len = 0;
 
     while (1) {
         ssize_t n = read(fd, buf, sizeof(buf));
-        if (n <= 0) break;  /* daemon closed or error */
+        if (n <= 0)
+            break; /* daemon closed or error */
 
         for (ssize_t i = 0; i < n; i++) {
             char c = buf[i];
@@ -140,8 +143,7 @@ void sock_client_listen(int fd, const char *type_filter,
                     if (root) {
                         if (type_filter) {
                             cJSON *t = cJSON_GetObjectItemCaseSensitive(root, "type");
-                            if (!cJSON_IsString(t) ||
-                                strcmp(t->valuestring, type_filter) != 0)
+                            if (!cJSON_IsString(t) || strcmp(t->valuestring, type_filter) != 0)
                                 pass = 0;
                         }
                         if (pass && player_filter) {

@@ -7,10 +7,12 @@ LDFLAGS = -lm \
           -lsystemd
 
 SRC = main.c util.c pw.c mpris.c sock.c
+HDR = util.h pw.h mpris.h sock.h
 OBJ = $(SRC:.c=.o)
 BIN = nyq
+FMT = clang-format
 
-.PHONY: all clean
+.PHONY: all clean lint format check
 
 all: $(BIN)
 
@@ -22,3 +24,11 @@ $(BIN): $(OBJ)
 
 clean:
 	rm -f $(OBJ) $(BIN)
+
+lint:
+	$(FMT) --dry-run --Werror $(SRC) $(HDR)
+
+format:
+	$(FMT) -i $(SRC) $(HDR)
+
+check: lint all

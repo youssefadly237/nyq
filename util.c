@@ -35,22 +35,28 @@ float volume_step(float level, int delta) {
         pct = (pct / 5) * 5;
     }
 
-    if (pct > 100) pct = 100;
-    if (pct < 0)   pct = 0;
+    if (pct > 100)
+        pct = 100;
+    if (pct < 0)
+        pct = 0;
 
     return pct / 100.0f;
 }
 
 const char *volume_icon(float level, bool muted) {
-    if (muted || level == 0.0f) return "audio-volume-muted";
-    if (level < 0.33f)          return "audio-volume-low";
-    if (level < 0.66f)          return "audio-volume-medium";
-    return                             "audio-volume-high";
+    if (muted || level == 0.0f)
+        return "audio-volume-muted";
+    if (level < 0.33f)
+        return "audio-volume-low";
+    if (level < 0.66f)
+        return "audio-volume-medium";
+    return "audio-volume-high";
 }
 
 int parse_name_json(const char *json, char *buf, int len) {
     cJSON *root = cJSON_Parse(json);
-    if (!root) return -1;
+    if (!root)
+        return -1;
 
     cJSON *name = cJSON_GetObjectItemCaseSensitive(root, "name");
     if (!cJSON_IsString(name) || !name->valuestring) {
@@ -65,7 +71,8 @@ int parse_name_json(const char *json, char *buf, int len) {
 
 static void emit_json(int fd, cJSON *root) {
     char *str = cJSON_PrintUnformatted(root);
-    if (!str) return;
+    if (!str)
+        return;
 
     int n = strlen(str);
     write_all(fd, str, n);
@@ -76,21 +83,21 @@ static void emit_json(int fd, cJSON *root) {
 
 void emit_sink(int fd, float level, bool muted) {
     cJSON *root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "type",  "sink");
+    cJSON_AddStringToObject(root, "type", "sink");
     cJSON_AddNumberToObject(root, "level", (double)level);
-    cJSON_AddBoolToObject  (root, "muted", muted);
-    cJSON_AddStringToObject(root, "icon",  volume_icon(level, muted));
+    cJSON_AddBoolToObject(root, "muted", muted);
+    cJSON_AddStringToObject(root, "icon", volume_icon(level, muted));
 
     emit_json(fd, root);
     cJSON_Delete(root);
 }
 
-void emit_player(int fd, const char *name, const char *title,
-                 const char *artist, const char *status, double volume) {
+void emit_player(int fd, const char *name, const char *title, const char *artist,
+                 const char *status, double volume) {
     cJSON *root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "type",   "player");
-    cJSON_AddStringToObject(root, "name",   name   ? name   : "");
-    cJSON_AddStringToObject(root, "title",  title  ? title  : "");
+    cJSON_AddStringToObject(root, "type", "player");
+    cJSON_AddStringToObject(root, "name", name ? name : "");
+    cJSON_AddStringToObject(root, "title", title ? title : "");
     cJSON_AddStringToObject(root, "artist", artist ? artist : "");
     cJSON_AddStringToObject(root, "status", status ? status : "Stopped");
     cJSON_AddNumberToObject(root, "volume", volume);
