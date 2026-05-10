@@ -7,37 +7,36 @@
 #include <unistd.h>
 
 #include <pipewire/pipewire.h>
+#include <pipewire/device.h>
 #include <pipewire/extensions/metadata.h>
 #include <spa/param/props.h>
+#include <spa/param/route.h>
 #include <spa/pod/parser.h>
 #include <spa/pod/builder.h>
 #include <spa/utils/result.h>
 
-#include <pipewire/device.h>
-#include <spa/param/route.h>
-
 /* ------------------------------------------------------------------ */
-/* Sink list for cycling                                              */
+/* Sink registry                                                        */
 /* ------------------------------------------------------------------ */
 
 #define MAX_SINKS 32
 
 typedef struct {
     uint32_t id;
+    uint32_t device_id; /* parent device object id, 0 = none */
     char name[256];
-    uint32_t device_id; /* device.id from node props, 0 = unknown */
 } SinkEntry;
 
 /* ------------------------------------------------------------------ */
-/* State shared across callbacks                                      */
+/* State                                                                */
 /* ------------------------------------------------------------------ */
 
 typedef enum {
-    PHASE_WAIT_GLOBALS,
-    PHASE_WAIT_BIND,
-    PHASE_WAIT_DEVICE_ROUTES,
-    PHASE_WAIT_PARAMS,
-    PHASE_WAIT_METADATA,
+    PHASE_WAIT_GLOBALS,  /* initial registry burst + metadata properties */
+    PHASE_WAIT_METADATA, /* extra roundtrip to ensure metadata arrived    */
+    PHASE_WAIT_BIND,     /* node + device bind roundtrip                  */
+    PHASE_WAIT_ROUTES,   /* device Route enum roundtrip                   */
+    PHASE_WAIT_PARAMS,   /* node Props enum                               */
     PHASE_DONE,
 } Phase;
 
@@ -66,21 +65,20 @@ typedef struct {
     struct pw_node *node;
     struct pw_device *device;
 
-    /* all known sinks */
     SinkEntry sinks[MAX_SINKS];
     int n_sinks;
 
-    /* current default sink */
     uint32_t target_id;
     char target_name[256];
 
-    /* current state read from Props */
+    /* props read from node */
     float level;
     bool muted;
     uint32_t n_channels;
 
-    int card_device; /* from on_node_info, -1 = unknown */
-    int route_index; /* output route index, -1 = unknown */
+    /* route info read from device */
+    int route_index; /* -1 = unknown */
+    int card_device; /* -1 = unknown */
 
     PwCmd cmd;
     int sync_seq;
@@ -89,17 +87,16 @@ typedef struct {
 } PwState;
 
 /* ------------------------------------------------------------------ */
-/* Forward declarations                                               */
+/* Forward declarations                                                 */
 /* ------------------------------------------------------------------ */
 
 static void start_bind(PwState *s);
+static void start_routes(PwState *s);
 static void start_params(PwState *s);
-static void set_route_param(PwState *s, int card_device, uint32_t n_channels, const float *vols,
-                            bool mute, bool set_vol, bool set_mute);
 static void finish(PwState *s);
 
 /* ------------------------------------------------------------------ */
-/* Core events                                                        */
+/* Core events                                                          */
 /* ------------------------------------------------------------------ */
 
 static void on_core_done(void *data, uint32_t id, int seq) {
@@ -109,23 +106,25 @@ static void on_core_done(void *data, uint32_t id, int seq) {
 
     switch (s->phase) {
     case PHASE_WAIT_GLOBALS:
-        s->phase = PHASE_WAIT_BIND;
-        if (s->target_name[0] != '\0')
-            start_bind(s);
-        break;
-    case PHASE_WAIT_BIND:
-        s->phase = PHASE_WAIT_DEVICE_ROUTES;
-        if (s->device)
-            pw_device_enum_params(s->device, 0, SPA_PARAM_Route, 0, -1, NULL);
+        /* extra roundtrip to ensure metadata properties have arrived */
+        s->phase = PHASE_WAIT_METADATA;
         s->sync_seq = pw_core_sync(s->core, PW_ID_CORE, 0);
         break;
-    case PHASE_WAIT_DEVICE_ROUTES:
+    case PHASE_WAIT_METADATA:
+        s->phase = PHASE_WAIT_BIND;
+        start_bind(s);
+        break;
+    case PHASE_WAIT_BIND:
+        s->phase = PHASE_WAIT_ROUTES;
+        start_routes(s);
+        break;
+    case PHASE_WAIT_ROUTES:
         s->phase = PHASE_WAIT_PARAMS;
         start_params(s);
         break;
-    case PHASE_WAIT_METADATA:
-        s->phase = PHASE_DONE;
-        pw_main_loop_quit(s->loop);
+    case PHASE_WAIT_PARAMS:
+        /* no Props param arrived — finish with level=0 */
+        finish(s);
         break;
     default:
         break;
@@ -153,19 +152,11 @@ static int on_metadata_property(void *data, uint32_t subject, const char *key, c
                                 const char *value) {
     PwState *s = data;
     (void)type;
-
-    if (subject != PW_ID_CORE)
-        return 0;
-    if (!key || !value)
+    if (subject != PW_ID_CORE || !key || !value)
         return 0;
     if (strcmp(key, "default.audio.sink") != 0)
         return 0;
-
     parse_name_json(value, s->target_name, sizeof(s->target_name));
-
-    if (s->phase == PHASE_WAIT_BIND)
-        start_bind(s);
-
     return 0;
 }
 
@@ -175,17 +166,39 @@ static const struct pw_metadata_events metadata_events = {
 };
 
 /* ------------------------------------------------------------------ */
-/* Node param event                                                   */
+/* Device param event — read Route index + card device                 */
 /* ------------------------------------------------------------------ */
 
-static void on_node_info(void *data, const struct pw_node_info *info) {
+static void on_device_param(void *data, int seq, uint32_t id, uint32_t index, uint32_t next,
+                            const struct spa_pod *param) {
     PwState *s = data;
-    if (info->props) {
-        const char *card_dev = spa_dict_lookup(info->props, "card.profile.device");
-        if (card_dev)
-            s->card_device = atoi(card_dev);
+    (void)seq;
+    (void)index;
+    (void)next;
+    if (id != SPA_PARAM_Route || !param)
+        return;
+
+    uint32_t route_idx = UINT32_MAX, route_device = UINT32_MAX, direction = UINT32_MAX;
+    spa_pod_parse_object(param, SPA_TYPE_OBJECT_ParamRoute, NULL, SPA_PARAM_ROUTE_index,
+                         SPA_POD_OPT_Int(&route_idx), SPA_PARAM_ROUTE_device,
+                         SPA_POD_OPT_Int(&route_device), SPA_PARAM_ROUTE_direction,
+                         SPA_POD_OPT_Id(&direction));
+
+    if (direction == (uint32_t)SPA_DIRECTION_OUTPUT && route_idx != UINT32_MAX &&
+        route_device != UINT32_MAX) {
+        s->route_index = (int)route_idx;
+        s->card_device = (int)route_device;
     }
 }
+
+static const struct pw_device_events device_events = {
+    PW_VERSION_DEVICE_EVENTS,
+    .param = on_device_param,
+};
+
+/* ------------------------------------------------------------------ */
+/* Node param event                                                     */
+/* ------------------------------------------------------------------ */
 
 static void on_node_param(void *data, int seq, uint32_t id, uint32_t index, uint32_t next,
                           const struct spa_pod *param) {
@@ -193,10 +206,7 @@ static void on_node_param(void *data, int seq, uint32_t id, uint32_t index, uint
     (void)seq;
     (void)index;
     (void)next;
-
-    if (id != SPA_PARAM_Props)
-        return;
-    if (s->phase == PHASE_DONE)
+    if (id != SPA_PARAM_Props || s->phase == PHASE_DONE)
         return;
 
     uint32_t n_vals = 0, val_size = 0, val_type = 0;
@@ -220,49 +230,11 @@ static void on_node_param(void *data, int seq, uint32_t id, uint32_t index, uint
 
 static const struct pw_node_events node_events = {
     PW_VERSION_NODE_EVENTS,
-    .info = on_node_info,
     .param = on_node_param,
 };
 
 /* ------------------------------------------------------------------ */
-/* Device param event                                                 */
-/* ------------------------------------------------------------------ */
-
-static void on_device_param(void *data, int seq, uint32_t id, uint32_t index, uint32_t next,
-                            const struct spa_pod *param) {
-    PwState *s = data;
-    (void)seq;
-    (void)index;
-    (void)next;
-
-    if (id != SPA_PARAM_Route)
-        return;
-    if (s->phase != PHASE_WAIT_DEVICE_ROUTES)
-        return;
-    if (!param)
-        return;
-
-    uint32_t route_idx = UINT32_MAX, route_device = UINT32_MAX;
-    int32_t direction = -1;
-
-    spa_pod_parse_object(param, SPA_TYPE_OBJECT_ParamRoute, NULL, SPA_PARAM_ROUTE_index,
-                         SPA_POD_OPT_Int(&route_idx), SPA_PARAM_ROUTE_device,
-                         SPA_POD_OPT_Int(&route_device), SPA_PARAM_ROUTE_direction,
-                         SPA_POD_OPT_Id((uint32_t *)&direction));
-
-    if ((uint32_t)s->card_device == route_device && direction == (int32_t)SPA_DIRECTION_OUTPUT &&
-        route_idx != UINT32_MAX) {
-        s->route_index = (int)route_idx;
-    }
-}
-
-static const struct pw_device_events device_events = {
-    PW_VERSION_DEVICE_EVENTS,
-    .param = on_device_param,
-};
-
-/* ------------------------------------------------------------------ */
-/* Registry events                                                    */
+/* Registry events                                                      */
 /* ------------------------------------------------------------------ */
 
 static void on_global(void *data, uint32_t id, uint32_t permissions, const char *type,
@@ -289,14 +261,11 @@ static void on_global(void *data, uint32_t id, uint32_t permissions, const char 
         if (strcmp(media_class, "Audio/Sink") != 0)
             return;
 
-        /* store in sink list */
-        const char *dev_id_str = spa_dict_lookup(props, "device.id");
-
         if (s->n_sinks < MAX_SINKS) {
+            const char *dev_str = spa_dict_lookup(props, "device.id");
             s->sinks[s->n_sinks].id = id;
+            s->sinks[s->n_sinks].device_id = dev_str ? (uint32_t)strtoul(dev_str, NULL, 10) : 0;
             snprintf(s->sinks[s->n_sinks].name, sizeof(s->sinks[s->n_sinks].name), "%s", node_name);
-            s->sinks[s->n_sinks].device_id =
-                dev_id_str ? (uint32_t)strtoul(dev_id_str, NULL, 10) : 0;
             s->n_sinks++;
         }
     }
@@ -318,7 +287,7 @@ static const struct pw_registry_events registry_events = {
 };
 
 /* ------------------------------------------------------------------ */
-/* Phase transitions                                                  */
+/* Phase transitions                                                    */
 /* ------------------------------------------------------------------ */
 
 static void start_bind(PwState *s) {
@@ -329,22 +298,23 @@ static void start_bind(PwState *s) {
         return;
     }
 
-    /* sink-next / sink-prev don't need to bind a node */
+    /* sink cycle commands don't need a node */
     if (s->cmd == PW_CMD_SINK_NEXT || s->cmd == PW_CMD_SINK_PREV) {
         finish(s);
         return;
     }
 
-    /* resolve default sink by name */
+    /* resolve target_id from target_name */
     s->target_id = 0;
-    if (s->target_name[0] != '\0') {
-        for (int i = 0; i < s->n_sinks; i++) {
-            if (strcmp(s->sinks[i].name, s->target_name) == 0) {
-                s->target_id = s->sinks[i].id;
-                break;
-            }
+    for (int i = 0; i < s->n_sinks; i++) {
+        if (strcmp(s->sinks[i].name, s->target_name) == 0) {
+            s->target_id = s->sinks[i].id;
+            break;
         }
     }
+    /* fallback: first sink */
+    if (s->target_id == 0 && s->n_sinks > 0)
+        s->target_id = s->sinks[0].id;
 
     if (s->target_id == 0) {
         fprintf(stderr, "nyq: no audio sink found\n");
@@ -353,11 +323,11 @@ static void start_bind(PwState *s) {
         return;
     }
 
-    s->node = pw_registry_bind(s->registry, s->target_id, PW_TYPE_INTERFACE_Node, PW_VERSION_NODE,
-                               sizeof(PwState *));
+    s->node =
+        pw_registry_bind(s->registry, s->target_id, PW_TYPE_INTERFACE_Node, PW_VERSION_NODE, 0);
     pw_node_add_listener(s->node, &s->node_listener, &node_events, s);
 
-    /* also bind parent device if known */
+    /* bind parent device if available */
     s->device = NULL;
     s->card_device = -1;
     s->route_index = -1;
@@ -365,11 +335,8 @@ static void start_bind(PwState *s) {
         if (s->sinks[i].id == s->target_id && s->sinks[i].device_id > 0) {
             s->device = (struct pw_device *)pw_registry_bind(
                 s->registry, s->sinks[i].device_id, PW_TYPE_INTERFACE_Device, PW_VERSION_DEVICE, 0);
-            if (s->device) {
-                uint32_t route_ids[] = {SPA_PARAM_Route};
+            if (s->device)
                 pw_device_add_listener(s->device, &s->device_listener, &device_events, s);
-                pw_device_subscribe_params(s->device, route_ids, 1);
-            }
             break;
         }
     }
@@ -377,14 +344,22 @@ static void start_bind(PwState *s) {
     s->sync_seq = pw_core_sync(s->core, PW_ID_CORE, 0);
 }
 
+static void start_routes(PwState *s) {
+    if (s->device) {
+        pw_device_enum_params(s->device, 0, SPA_PARAM_Route, 0, -1, NULL);
+    }
+    s->sync_seq = pw_core_sync(s->core, PW_ID_CORE, 0);
+}
+
 static void start_params(PwState *s) {
     uint32_t ids[] = {SPA_PARAM_Props};
     pw_node_subscribe_params(s->node, ids, 1);
     pw_node_enum_params(s->node, 0, SPA_PARAM_Props, 0, 1, NULL);
+    s->sync_seq = pw_core_sync(s->core, PW_ID_CORE, 0);
 }
 
 /* ------------------------------------------------------------------ */
-/* Sink cycling                                                       */
+/* Sink cycling                                                          */
 /* ------------------------------------------------------------------ */
 
 static void do_sink_cycle(PwState *s, int dir) {
@@ -395,14 +370,10 @@ static void do_sink_cycle(PwState *s, int dir) {
         return;
     }
 
-    /* start from the current default */
-    char last[256];
-    snprintf(last, sizeof(last), "%s", s->target_name);
-
-    /* find last in sink list */
+    /* find current default in sink list */
     int cur = 0;
     for (int i = 0; i < s->n_sinks; i++) {
-        if (strcmp(s->sinks[i].name, last) == 0) {
+        if (strcmp(s->sinks[i].name, s->target_name) == 0) {
             cur = i;
             break;
         }
@@ -411,7 +382,6 @@ static void do_sink_cycle(PwState *s, int dir) {
     int next = (cur + dir + s->n_sinks) % s->n_sinks;
     const char *new_name = s->sinks[next].name;
 
-    /* set default.audio.sink in metadata */
     char value[320];
     snprintf(value, sizeof(value), "{\"name\":\"%s\"}", new_name);
     pw_metadata_set_property(s->metadata, PW_ID_CORE, "default.audio.sink", "Spa:String:JSON",
@@ -422,62 +392,58 @@ static void do_sink_cycle(PwState *s, int dir) {
     fprintf(stdout, "{\"type\":\"sink-switch\",\"name\":\"%s\"}\n", new_name);
     fflush(stdout);
 
-    s->phase = PHASE_WAIT_METADATA;
-    s->sync_seq = pw_core_sync(s->core, PW_ID_CORE, 0);
+    s->phase = PHASE_DONE;
+    pw_main_loop_quit(s->loop);
 }
 
 /* ------------------------------------------------------------------ */
-/* Route param helper                                                 */
+/* Route set helper — mirrors pulse-server exactly                      */
 /* ------------------------------------------------------------------ */
 
-static void set_route_param(PwState *s, int card_device, uint32_t n_channels, const float *vols,
-                            bool mute, bool set_vol, bool set_mute) {
-    uint8_t rbuf[1024];
-    struct spa_pod_builder rb = SPA_POD_BUILDER_INIT(rbuf, sizeof(rbuf));
-    struct spa_pod_frame rf[2];
+static void set_via_route(PwState *s, const float *vols, uint32_t n_ch, bool mute, bool set_vol,
+                          bool set_mute) {
+    char buf[1024];
+    struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
+    struct spa_pod_frame f[2];
 
-    int route_idx = s->route_index >= 0 ? s->route_index : 0;
+    spa_pod_builder_push_object(&b, &f[0], SPA_TYPE_OBJECT_ParamRoute, SPA_PARAM_Route);
+    spa_pod_builder_add(&b, SPA_PARAM_ROUTE_index, SPA_POD_Int(s->route_index),
+                        SPA_PARAM_ROUTE_device, SPA_POD_Int(s->card_device), 0);
 
-    spa_pod_builder_push_object(&rb, &rf[0], SPA_TYPE_OBJECT_ParamRoute, SPA_PARAM_Route);
-    spa_pod_builder_add(&rb, SPA_PARAM_ROUTE_index, SPA_POD_Int(route_idx), SPA_PARAM_ROUTE_device,
-                        SPA_POD_Int(card_device), SPA_PARAM_ROUTE_save, SPA_POD_Bool(true));
+    spa_pod_builder_prop(&b, SPA_PARAM_ROUTE_props, 0);
+    spa_pod_builder_push_object(&b, &f[1], SPA_TYPE_OBJECT_Props, SPA_PARAM_Props);
 
-    spa_pod_builder_prop(&rb, SPA_PARAM_ROUTE_props, 0);
-    spa_pod_builder_push_object(&rb, &rf[1], SPA_TYPE_OBJECT_Props, SPA_PARAM_Route);
-
+    if (set_vol && vols && n_ch > 0)
+        spa_pod_builder_add(&b, SPA_PROP_channelVolumes,
+                            SPA_POD_Array(sizeof(float), SPA_TYPE_Float, n_ch, vols), 0);
     if (set_mute)
-        spa_pod_builder_add(&rb, SPA_PROP_mute, SPA_POD_Bool(mute));
-    if (set_vol)
-        spa_pod_builder_add(&rb, SPA_PROP_channelVolumes,
-                            SPA_POD_Array(sizeof(float), SPA_TYPE_Float, n_channels, vols));
+        spa_pod_builder_add(&b, SPA_PROP_mute, SPA_POD_Bool(mute), 0);
 
-    spa_pod_builder_pop(&rb, &rf[1]);
-    spa_pod_builder_pop(&rb, &rf[0]);
+    spa_pod_builder_pop(&b, &f[1]);
 
-    struct spa_pod *route = (struct spa_pod *)spa_pod_builder_deref(&rb, rf[0].offset);
-    pw_device_set_param(s->device, SPA_PARAM_Route, 0, route);
+    spa_pod_builder_prop(&b, SPA_PARAM_ROUTE_save, 0);
+    spa_pod_builder_bool(&b, true);
+
+    struct spa_pod *param = spa_pod_builder_pop(&b, &f[0]);
+    pw_device_set_param(s->device, SPA_PARAM_Route, 0, param);
 }
 
 /* ------------------------------------------------------------------ */
-/* Finish: apply command and emit result                              */
+/* Finish                                                               */
 /* ------------------------------------------------------------------ */
 
 static void finish(PwState *s) {
-    switch (s->cmd) {
-    case PW_CMD_SINK_NEXT:
+    if (s->cmd == PW_CMD_SINK_NEXT) {
         do_sink_cycle(s, +1);
         return;
-    case PW_CMD_SINK_PREV:
+    }
+    if (s->cmd == PW_CMD_SINK_PREV) {
         do_sink_cycle(s, -1);
         return;
-    default:
-        break;
     }
 
-    /* determine if we can use Route on the device */
-    bool via_route = (s->device != NULL && s->card_device >= 0);
+    bool via_route = (s->device != NULL && s->card_device >= 0 && s->route_index >= 0);
 
-    /* volume / mute commands */
     if (s->cmd == PW_CMD_VOL_UP || s->cmd == PW_CMD_VOL_DOWN) {
         int delta = (s->cmd == PW_CMD_VOL_UP) ? +5 : -5;
         float new_level = volume_step(s->level, delta);
@@ -488,7 +454,7 @@ static void finish(PwState *s) {
             vols[i] = new_linear;
 
         if (via_route) {
-            set_route_param(s, s->card_device, s->n_channels, vols, false, true, false);
+            set_via_route(s, vols, s->n_channels, false, true, false);
         } else {
             uint8_t buf[1024];
             struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
@@ -501,9 +467,8 @@ static void finish(PwState *s) {
 
     } else if (s->cmd == PW_CMD_MUTE) {
         bool new_mute = !s->muted;
-
         if (via_route) {
-            set_route_param(s, s->card_device, 0, NULL, new_mute, false, true);
+            set_via_route(s, NULL, 0, new_mute, false, true);
         } else {
             uint8_t buf[256];
             struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
@@ -520,31 +485,33 @@ static void finish(PwState *s) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Common entry point                                                   */
+/* Entry point                                                          */
 /* ------------------------------------------------------------------ */
 
 static int pw_oneshot_run(PwCmd cmd) {
     PwState s = {0};
     s.cmd = cmd;
+    s.card_device = -1;
+    s.route_index = -1;
 
     pw_init(NULL, NULL);
 
     s.loop = pw_main_loop_new(NULL);
     if (!s.loop) {
         fprintf(stderr, "nyq: pw_main_loop_new failed\n");
-        return -1;
+        goto cleanup;
     }
 
     s.ctx = pw_context_new(pw_main_loop_get_loop(s.loop), NULL, 0);
     if (!s.ctx) {
         fprintf(stderr, "nyq: pw_context_new failed\n");
-        return -1;
+        goto cleanup;
     }
 
     s.core = pw_context_connect(s.ctx, NULL, 0);
     if (!s.core) {
         fprintf(stderr, "nyq: pw_context_connect failed\n");
-        return -1;
+        goto cleanup;
     }
 
     s.registry = pw_core_get_registry(s.core, PW_VERSION_REGISTRY, 0);
@@ -556,6 +523,7 @@ static int pw_oneshot_run(PwCmd cmd) {
 
     pw_main_loop_run(s.loop);
 
+cleanup:
     if (s.node) {
         spa_hook_remove(&s.node_listener);
         pw_proxy_destroy((struct pw_proxy *)s.node);
@@ -568,17 +536,23 @@ static int pw_oneshot_run(PwCmd cmd) {
         spa_hook_remove(&s.metadata_listener);
         pw_proxy_destroy((struct pw_proxy *)s.metadata);
     }
-    pw_proxy_destroy((struct pw_proxy *)s.registry);
-    pw_core_disconnect(s.core);
-    pw_context_destroy(s.ctx);
-    pw_main_loop_destroy(s.loop);
+    if (s.registry) {
+        spa_hook_remove(&s.registry_listener);
+        pw_proxy_destroy((struct pw_proxy *)s.registry);
+    }
+    if (s.core)
+        pw_core_disconnect(s.core);
+    if (s.ctx)
+        pw_context_destroy(s.ctx);
+    if (s.loop)
+        pw_main_loop_destroy(s.loop);
     pw_deinit();
 
     return s.error;
 }
 
 /* ------------------------------------------------------------------ */
-/* Public API                                                         */
+/* Public API                                                           */
 /* ------------------------------------------------------------------ */
 
 int pw_oneshot_status(void) {
