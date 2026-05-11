@@ -1,5 +1,7 @@
 # nyq
 
+named after Nyquist Theorem
+
 A small daemon that monitors PipeWire audio sinks and MPRIS media players and
 exposes their state over a Unix socket as newline-delimited JSON.
 
@@ -68,22 +70,42 @@ All events are JSON objects terminated by a newline.
 **Sink:**
 
 ```json
-{"type":"sink","name":"alsa_output.pci-...","level":0.75,"muted":false,"icon":"audio-volume-high","default":true}
+{
+  "type": "sink",
+  "name": "alsa_output.pci-...",
+  "level": 0.75,
+  "muted": false,
+  "icon": "audio-volume-high",
+  "default": true
+}
 ```
 
 **Sink switch:**
 
 ```json
-{"type":"sink-switch","name":"alsa_output.pci-..."}
+{ "type": "sink-switch", "name": "alsa_output.pci-..." }
 ```
 
 **Player:**
 
 ```json
-{"type":"player","name":"spotify","title":"Scatterbrain","artist":"Emei","status":"Playing","volume":1.0}
+{
+  "type": "player",
+  "name": "spotify",
+  "title": "Scatterbrain",
+  "artist": "Emei",
+  "status": "Playing",
+  "volume": 1.0
+}
 ```
 
-`level` is perceptual (cubic root of linear), in the range `0.0–1.0`. `icon` is a freedesktop icon name.
+`level` is perceptual (cubic root of linear), in the range `0.0–1.0`. `icon` is
+a freedesktop icon name.
 
-`muted` field goes crazy, for spotify it just shows 0 vol instead of muted, brave
-just show status as stopped, so it is unstable
+## Known issues
+
+- Spotify exposes `Volume` via MPRIS but reports a low value instead of true mute.
+  Muted audio shows `"level":0.0` rather than `"muted":true`.
+- Brave/Chromium browsers expose one MPRIS interface for the whole browser.
+  Multiple tabs map to the same player name, so per-tab title/artist is
+  impossible.
