@@ -77,7 +77,7 @@ static int resolve_player(sd_bus *bus, const char *name, char *buf, int len) {
             continue;
         const char *player = bname + strlen(MPRIS_PREFIX);
         if (!name || strstr(player, name)) {
-            snprintf(buf, len, "%s", bname);
+            s_copy(buf, len, bname);
             found = 1;
             break;
         }

@@ -64,7 +64,7 @@ int parse_name_json(const char *json, char *buf, int len) {
         return -1;
     }
 
-    snprintf(buf, len, "%s", name->valuestring);
+    s_copy(buf, len, name->valuestring);
     cJSON_Delete(root);
     return 0;
 }

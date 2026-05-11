@@ -79,7 +79,7 @@ static int eq_pop(char *out, int len) {
         pthread_mutex_unlock(&eq.lock);
         return 0;
     }
-    snprintf(out, len, "%s", eq.items[eq.head].json);
+    s_copy(out, len, eq.items[eq.head].json);
     eq.head = (eq.head + 1) % EVENT_QUEUE_SIZE;
     pthread_mutex_unlock(&eq.lock);
     return 1;
@@ -722,9 +722,9 @@ static void push_stream_player_event(DaemonStream *stream, double volume, bool m
     const char *name = stream->name;
     uint32_t client_id = stream->client_id;
 
-    snprintf(out_name, sizeof(out_name), "%s", name && name[0] ? name : "player");
-    snprintf(title, sizeof(title), "%s", stream->title);
-    snprintf(artist, sizeof(artist), "%s", stream->artist);
+    s_copy(out_name, sizeof(out_name), name && name[0] ? name : "player");
+    s_copy(title, sizeof(title), stream->title);
+    s_copy(artist, sizeof(artist), stream->artist);
 
     pthread_mutex_lock(&g_bus_lock);
     if (g_bus) {
@@ -743,12 +743,12 @@ static void push_stream_player_event(DaemonStream *stream, double volume, bool m
         if (!p && client && client->app_name[0])
             p = bus_find_by_name(g_bus, client->app_name);
         if (p) {
-            snprintf(out_name, sizeof(out_name), "%s", p->shortname);
+            s_copy(out_name, sizeof(out_name), p->shortname);
             if (!stream->title[0] && p->title[0]) {
-                snprintf(title, sizeof(title), "%s", p->title);
-                snprintf(artist, sizeof(artist), "%s", p->artist);
+                s_copy(title, sizeof(title), p->title);
+                s_copy(artist, sizeof(artist), p->artist);
             }
-            snprintf(status, sizeof(status), "%s", p->status[0] ? p->status : "Stopped");
+            s_copy(status, sizeof(status), p->status[0] ? p->status : "Stopped");
             p->volume = volume;
             p->has_stream_muted = true;
             p->stream_muted = muted;

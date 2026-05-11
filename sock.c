@@ -13,15 +13,21 @@
 
 /* Socket path */
 
+static const char *runtime_dir(void) {
+    const char *runtime = getenv("XDG_RUNTIME_DIR");
+    if (!runtime)
+        fprintf(stderr, "nyq: XDG_RUNTIME_DIR not set\n");
+    return runtime;
+}
+
 static const char *sock_path(void) {
-    /* sun_path is 108 bytes on Linux - cap path to fit */
     static char path[108];
     if (path[0])
         return path;
 
-    const char *runtime = getenv("XDG_RUNTIME_DIR");
+    const char *runtime = runtime_dir();
     if (!runtime)
-        runtime = "/tmp";
+        return NULL;
     snprintf(path, sizeof(path), "%s/nyq.sock", runtime);
     return path;
 }
@@ -31,21 +37,25 @@ static const char *lock_path(void) {
     if (path[0])
         return path;
 
-    const char *runtime = getenv("XDG_RUNTIME_DIR");
+    const char *runtime = runtime_dir();
     if (!runtime)
-        runtime = "/tmp";
+        return NULL;
     snprintf(path, sizeof(path), "%s/nyq.lock", runtime);
     return path;
 }
 
 void sock_cleanup(void) {
-    unlink(lock_path());
+    const char *path = lock_path();
+    if (path)
+        unlink(path);
 }
 
 /* Server */
 
 int sock_server_init(void) {
     const char *lockfile = lock_path();
+    if (!lockfile)
+        return -1;
 
     /* Check for existing lock */
     FILE *lock = fopen(lockfile, "r");
@@ -72,6 +82,8 @@ int sock_server_init(void) {
     fclose(lock);
 
     const char *path = sock_path();
+    if (!path)
+        return -1;
 
     /* remove stale socket */
     unlink(path);
@@ -134,6 +146,10 @@ void sock_broadcast(int *clients, int *n_clients, const char *json) {
 /* Client */
 
 int sock_client_connect(void) {
+    const char *path = sock_path();
+    if (!path)
+        return -1;
+
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
         perror("nyq: socket");
@@ -142,13 +158,13 @@ int sock_client_connect(void) {
 
     struct sockaddr_un addr = {0};
     addr.sun_family = AF_UNIX;
-    memcpy(addr.sun_path, sock_path(), sizeof(addr.sun_path));
+    memcpy(addr.sun_path, path, sizeof(addr.sun_path));
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         fprintf(stderr,
                 "nyq: cannot connect to daemon at %s: %s\n"
                 "nyq: is 'nyq daemon' running?\n",
-                sock_path(), strerror(errno));
+                path, strerror(errno));
         close(fd);
         return -1;
     }
