@@ -15,6 +15,8 @@
 #include <spa/pod/builder.h>
 #include <spa/utils/result.h>
 
+#include <cJSON.h>
+
 /* ------------------------------------------------------------------ */
 /* Sink registry                                                        */
 /* ------------------------------------------------------------------ */
@@ -382,15 +384,28 @@ static void do_sink_cycle(PwState *s, int dir) {
     int next = (cur + dir + s->n_sinks) % s->n_sinks;
     const char *new_name = s->sinks[next].name;
 
-    char value[320];
-    snprintf(value, sizeof(value), "{\"name\":\"%s\"}", new_name);
-    pw_metadata_set_property(s->metadata, PW_ID_CORE, "default.audio.sink", "Spa:String:JSON",
-                             value);
-    pw_metadata_set_property(s->metadata, PW_ID_CORE, "default.configured.audio.sink",
-                             "Spa:String:JSON", value);
+    cJSON *meta = cJSON_CreateObject();
+    cJSON_AddStringToObject(meta, "name", new_name);
+    char *value = cJSON_PrintUnformatted(meta);
+    cJSON_Delete(meta);
+    if (value) {
+        pw_metadata_set_property(s->metadata, PW_ID_CORE, "default.audio.sink", "Spa:String:JSON",
+                                 value);
+        pw_metadata_set_property(s->metadata, PW_ID_CORE, "default.configured.audio.sink",
+                                 "Spa:String:JSON", value);
+        cJSON_free(value);
+    }
 
-    fprintf(stdout, "{\"type\":\"sink-switch\",\"name\":\"%s\"}\n", new_name);
-    fflush(stdout);
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "sink-switch");
+    cJSON_AddStringToObject(root, "name", new_name);
+    char *out = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (out) {
+        fprintf(stdout, "%s\n", out);
+        fflush(stdout);
+        cJSON_free(out);
+    }
 
     s->phase = PHASE_DONE;
     pw_main_loop_quit(s->loop);
