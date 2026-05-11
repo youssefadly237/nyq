@@ -142,6 +142,7 @@ static void push_player_event(const char *shortname, const char *title, const ch
 
 typedef struct {
     uint32_t id;
+    pid_t pid;
     char app_name[128];
     char app_id[128];
     char process_binary[128];
@@ -226,7 +227,8 @@ static DaemonPwClient *pw_find_client(PwDaemon *d, uint32_t id) {
     return NULL;
 }
 
-static void pw_update_stream_metadata(PwDaemon *d, DaemonStream *stream, const struct spa_dict *props) {
+static void pw_update_stream_metadata(PwDaemon *d, DaemonStream *stream,
+                                      const struct spa_dict *props) {
     const char *app_name = props ? spa_dict_lookup(props, PW_KEY_APP_NAME) : NULL;
     const char *process_binary = props ? spa_dict_lookup(props, PW_KEY_APP_PROCESS_BINARY) : NULL;
     const char *app_id = props ? spa_dict_lookup(props, PW_KEY_APP_ID) : NULL;
@@ -517,6 +519,10 @@ static void on_global_daemon(void *data, uint32_t id, uint32_t permissions, cons
         memset(client, 0, sizeof(*client));
         client->id = id;
 
+        const char *pid_str = spa_dict_lookup(props, PW_KEY_SEC_PID);
+        if (pid_str)
+            client->pid = (pid_t)strtol(pid_str, NULL, 10);
+
         const char *app_name = spa_dict_lookup(props, PW_KEY_APP_NAME);
         const char *app_id = spa_dict_lookup(props, PW_KEY_APP_ID);
         const char *process_binary = spa_dict_lookup(props, PW_KEY_APP_PROCESS_BINARY);
@@ -740,17 +746,21 @@ static void push_stream_player_event(DaemonStream *stream, double volume, bool m
     pthread_mutex_lock(&g_bus_lock);
     if (g_bus) {
         PlayerState *p = NULL;
+        DaemonPwClient *client = NULL;
 
         if (pid > 0)
             p = bus_find_by_pid(g_bus, pid);
+        if (!p && client_id > 0 && g_pw) {
+            client = pw_find_client(g_pw, client_id);
+            if (client && client->pid > 0)
+                p = bus_find_by_pid(g_bus, client->pid);
+        }
         if (!p && name && name[0])
             p = bus_find_by_name(g_bus, name);
-        if (!p && client_id > 0 && g_pw) {
-            DaemonPwClient *client = pw_find_client(g_pw, client_id);
-            if (client && client->app_name[0])
-                p = bus_find_by_name(g_bus, client->app_name);
-        }
+        if (!p && client && client->app_name[0])
+            p = bus_find_by_name(g_bus, client->app_name);
         if (p) {
+            snprintf(out_name, sizeof(out_name), "%s", p->shortname);
             snprintf(out_name, sizeof(out_name), "%s", p->shortname);
             if (p->title[0]) {
                 snprintf(title, sizeof(title), "%s", p->title);
@@ -767,7 +777,8 @@ static void push_stream_player_event(DaemonStream *stream, double volume, bool m
     }
     pthread_mutex_unlock(&g_bus_lock);
 
-    push_player_event_full(out_name, title, artist, matched ? status : "Playing", volume, true, muted);
+    push_player_event_full(out_name, title, artist, matched ? status : "Playing", volume, true,
+                           muted);
 }
 
 static PlayerState *bus_add_player(BusDaemon *b, const char *busname) {
