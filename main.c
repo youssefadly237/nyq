@@ -65,8 +65,11 @@ int main(int argc, char *argv[]) {
     const char *name = argc >= 3 ? argv[2] : NULL;
 
     /* daemon */
-    if (strcmp(cmd, "daemon") == 0)
-        return daemon_run();
+    if (strcmp(cmd, "daemon") == 0) {
+        int r = daemon_run();
+        sock_cleanup();
+        return r;
+    }
 
     /* listen */
     if (strcmp(cmd, "listen") == 0)

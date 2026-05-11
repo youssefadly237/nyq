@@ -5,6 +5,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 
@@ -25,9 +26,51 @@ static const char *sock_path(void) {
     return path;
 }
 
+static const char *lock_path(void) {
+    static char path[108];
+    if (path[0])
+        return path;
+
+    const char *runtime = getenv("XDG_RUNTIME_DIR");
+    if (!runtime)
+        runtime = "/tmp";
+    snprintf(path, sizeof(path), "%s/nyq.lock", runtime);
+    return path;
+}
+
+void sock_cleanup(void) {
+    unlink(lock_path());
+}
+
 /* Server */
 
 int sock_server_init(void) {
+    const char *lockfile = lock_path();
+
+    /* Check for existing lock */
+    FILE *lock = fopen(lockfile, "r");
+    if (lock) {
+        pid_t old_pid = 0;
+        if (fscanf(lock, "%d", &old_pid) == 1 && old_pid > 0) {
+            /* Check if process is actually running */
+            if (kill(old_pid, 0) == 0) {
+                fclose(lock);
+                fprintf(stderr, "nyq: daemon already running (pid %d)\n", old_pid);
+                return -1;
+            }
+        }
+        fclose(lock);
+    }
+
+    /* Write our PID to lock file */
+    lock = fopen(lockfile, "w");
+    if (!lock) {
+        perror("nyq: lock file");
+        return -1;
+    }
+    fprintf(lock, "%d\n", getpid());
+    fclose(lock);
+
     const char *path = sock_path();
 
     /* remove stale socket */

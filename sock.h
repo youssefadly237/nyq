@@ -31,3 +31,6 @@ int sock_client_connect(void);
 /* Read and print lines from the socket, filtering by type if non-NULL.
  * Blocks until the connection closes. */
 void sock_client_listen(int fd, const char *type_filter, const char *player_filter);
+
+/* Clean up lock file (called on daemon exit) */
+void sock_cleanup(void);
