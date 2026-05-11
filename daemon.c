@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
+#include <pthread.h>
 #include <sys/epoll.h>
 
 #include <pipewire/pipewire.h>
@@ -19,16 +20,19 @@
 #include <spa/pod/builder.h>
 
 #include <systemd/sd-bus.h>
-#include <pthread.h>
+#include <cJSON.h>
 
 /* ------------------------------------------------------------------ */
 /* Constants                                                            */
 /* ------------------------------------------------------------------ */
 
 #define MAX_SINKS 32
+#define MAX_PLAYERS 16
 #define MAX_CLIENTS SOCK_MAX_CLIENTS
-#define WAKEUP_SINK 's'
-#define WAKEUP_PLAYER 'p'
+#define EVENT_QUEUE_SIZE 64
+#define EVENT_JSON_SIZE 768
+
+#define WAKEUP_BYTE 'e'
 
 #define MPRIS_PREFIX "org.mpris.MediaPlayer2."
 #define MPRIS_PATH "/org/mpris/MediaPlayer2"
@@ -38,14 +42,12 @@
 #define DBUS_PATH "/org/freedesktop/DBus"
 
 /* ------------------------------------------------------------------ */
-/* Shared event queue (PW thread -> main thread)                        */
+/* Event queue (PW thread -> main thread)                               */
 /* ------------------------------------------------------------------ */
 
 typedef struct {
-    char json[512];
+    char json[EVENT_JSON_SIZE];
 } Event;
-
-#define EVENT_QUEUE_SIZE 64
 
 typedef struct {
     Event items[EVENT_QUEUE_SIZE];
@@ -78,6 +80,60 @@ static int eq_pop(char *out, int len) {
 }
 
 /* ------------------------------------------------------------------ */
+/* JSON helpers using cJSON                                             */
+/* ------------------------------------------------------------------ */
+
+/* Serialize a cJSON object to a newline-terminated string and push
+ * it onto the event queue. Frees root. */
+static void eq_push_json(cJSON *root) {
+    char *str = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!str)
+        return;
+
+    /* append newline */
+    size_t len = strlen(str);
+    if (len + 2 < EVENT_JSON_SIZE) {
+        char buf[EVENT_JSON_SIZE];
+        memcpy(buf, str, len);
+        buf[len] = '\n';
+        buf[len + 1] = '\0';
+        eq_push(buf);
+    }
+    cJSON_free(str);
+}
+
+static void push_sink_event(const char *name, float level, bool muted, bool is_default) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "sink");
+    cJSON_AddStringToObject(root, "name", name);
+    cJSON_AddNumberToObject(root, "level", (double)level);
+    cJSON_AddBoolToObject(root, "muted", muted);
+    cJSON_AddStringToObject(root, "icon", volume_icon(level, muted));
+    cJSON_AddBoolToObject(root, "default", is_default);
+    eq_push_json(root);
+}
+
+static void push_sink_switch_event(const char *name) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "sink-switch");
+    cJSON_AddStringToObject(root, "name", name);
+    eq_push_json(root);
+}
+
+static void push_player_event(const char *shortname, const char *title, const char *artist,
+                              const char *status, double volume) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "player");
+    cJSON_AddStringToObject(root, "name", shortname ? shortname : "");
+    cJSON_AddStringToObject(root, "title", title ? title : "");
+    cJSON_AddStringToObject(root, "artist", artist ? artist : "");
+    cJSON_AddStringToObject(root, "status", status ? status : "Stopped");
+    cJSON_AddNumberToObject(root, "volume", volume);
+    eq_push_json(root);
+}
+
+/* ------------------------------------------------------------------ */
 /* PipeWire daemon state                                                */
 /* ------------------------------------------------------------------ */
 
@@ -103,7 +159,6 @@ typedef struct {
     struct pw_core *core;
     struct pw_registry *registry;
 
-    struct spa_hook core_listener;
     struct spa_hook registry_listener;
     struct spa_hook metadata_listener;
 
@@ -113,8 +168,10 @@ typedef struct {
     int n_sinks;
     char default_name[256];
 
-    int wakeup_fd; /* write end of pipe */
+    int wakeup_fd;
 } PwDaemon;
+
+static PwDaemon *g_pw = NULL;
 
 /* ------------------------------------------------------------------ */
 /* Forward declarations                                                 */
@@ -136,7 +193,10 @@ static void on_device_param_daemon(void *data, int seq, uint32_t id, uint32_t in
     if (id != SPA_PARAM_Route || !param)
         return;
 
-    uint32_t route_idx = UINT32_MAX, route_device = UINT32_MAX, direction = UINT32_MAX;
+    uint32_t route_idx = UINT32_MAX;
+    uint32_t route_device = UINT32_MAX;
+    uint32_t direction = UINT32_MAX;
+
     spa_pod_parse_object(param, SPA_TYPE_OBJECT_ParamRoute, NULL, SPA_PARAM_ROUTE_index,
                          SPA_POD_OPT_Int(&route_idx), SPA_PARAM_ROUTE_device,
                          SPA_POD_OPT_Int(&route_device), SPA_PARAM_ROUTE_direction,
@@ -155,13 +215,11 @@ static const struct pw_device_events device_events_daemon = {
 };
 
 /* ------------------------------------------------------------------ */
-/* The container_of mess is ugly — use a global PwDaemon pointer       */
+/* Node param callback                                                  */
 /* ------------------------------------------------------------------ */
 
-static PwDaemon *g_pw = NULL;
-
-static void on_node_param_v2(void *data, int seq, uint32_t id, uint32_t index, uint32_t next,
-                             const struct spa_pod *param) {
+static void on_node_param_daemon(void *data, int seq, uint32_t id, uint32_t index, uint32_t next,
+                                 const struct spa_pod *param) {
     DaemonSink *sink = data;
     (void)seq;
     (void)index;
@@ -193,25 +251,17 @@ static void on_node_param_v2(void *data, int seq, uint32_t id, uint32_t index, u
     if (!g_pw)
         return;
 
-    /* FIX 1: emit for ALL sinks, not just the default.
-     * Include the sink name so clients can filter if needed. */
-    char json[512];
-    snprintf(json, sizeof(json),
-             "{\"type\":\"sink\",\"name\":\"%s\",\"level\":%.4f,\"muted\":%s,\"icon\":\"%s\","
-             "\"default\":%s}\n",
-             sink->name, sink->level, sink->muted ? "true" : "false",
-             volume_icon(sink->level, sink->muted),
-             strcmp(sink->name, g_pw->default_name) == 0 ? "true" : "false");
+    bool is_default = strcmp(sink->name, g_pw->default_name) == 0;
+    push_sink_event(sink->name, sink->level, sink->muted, is_default);
 
-    eq_push(json);
-    char b = WAKEUP_SINK;
+    char b = WAKEUP_BYTE;
     ssize_t r = write(g_pw->wakeup_fd, &b, 1);
     (void)r;
 }
 
-static const struct pw_node_events node_events_v2 = {
+static const struct pw_node_events node_events_daemon = {
     PW_VERSION_NODE_EVENTS,
-    .param = on_node_param_v2,
+    .param = on_node_param_daemon,
 };
 
 /* ------------------------------------------------------------------ */
@@ -234,30 +284,19 @@ static int on_metadata_property_daemon(void *data, uint32_t subject, const char 
 
     snprintf(d->default_name, sizeof(d->default_name), "%s", new_name);
 
-    /* emit sink-switch */
-    char json[320];
-    snprintf(json, sizeof(json), "{\"type\":\"sink-switch\",\"name\":\"%s\"}\n", new_name);
-    eq_push(json);
-    char b = WAKEUP_SINK;
-    ssize_t r = write(d->wakeup_fd, &b, 1);
-    (void)r;
+    push_sink_switch_event(new_name);
 
-    /* emit new default sink's current state */
+    /* emit new default's current state */
     for (int i = 0; i < d->n_sinks; i++) {
         if (strcmp(d->sinks[i].name, new_name) == 0) {
-            char sjson[320];
-            snprintf(sjson, sizeof(sjson),
-                     "{\"type\":\"sink\",\"name\":\"%s\",\"level\":%.4f,\"muted\":%s,"
-                     "\"icon\":\"%s\",\"default\":true}\n",
-                     d->sinks[i].name, d->sinks[i].level, d->sinks[i].muted ? "true" : "false",
-                     volume_icon(d->sinks[i].level, d->sinks[i].muted));
-            eq_push(sjson);
-            r = write(d->wakeup_fd, &b, 1);
-            (void)r;
+            push_sink_event(d->sinks[i].name, d->sinks[i].level, d->sinks[i].muted, true);
             break;
         }
     }
 
+    char b = WAKEUP_BYTE;
+    ssize_t r = write(d->wakeup_fd, &b, 1);
+    (void)r;
     return 0;
 }
 
@@ -333,7 +372,7 @@ static void on_global_daemon(void *data, uint32_t id, uint32_t permissions, cons
 
         sink->node = pw_registry_bind(d->registry, id, PW_TYPE_INTERFACE_Node, PW_VERSION_NODE, 0);
         if (sink->node)
-            pw_node_add_listener(sink->node, &sink->node_listener, &node_events_v2, sink);
+            pw_node_add_listener(sink->node, &sink->node_listener, &node_events_daemon, sink);
 
         pw_bind_sink_device(d, sink);
         pw_subscribe_sink(sink);
@@ -352,7 +391,6 @@ static void on_global_remove_daemon(void *data, uint32_t id) {
                 spa_hook_remove(&d->sinks[i].device_listener);
                 pw_proxy_destroy((struct pw_proxy *)d->sinks[i].device);
             }
-            /* compact array */
             d->sinks[i] = d->sinks[--d->n_sinks];
             break;
         }
@@ -370,16 +408,14 @@ static const struct pw_registry_events registry_events_daemon = {
 /* ------------------------------------------------------------------ */
 
 typedef struct {
-    char busname[128];    /* well-known: org.mpris.MediaPlayer2.spotify */
-    char unique_name[64]; /* unique:     :1.42 — used to match signals  */
+    char busname[128];
+    char unique_name[64];
     char shortname[64];
     char title[256];
     char artist[256];
     char status[32];
     double volume;
 } PlayerState;
-
-#define MAX_PLAYERS 16
 
 typedef struct {
     sd_bus *bus;
@@ -391,12 +427,10 @@ typedef struct {
 } BusDaemon;
 
 /* ------------------------------------------------------------------ */
-/* Player lookup helpers                                                */
+/* Player helpers                                                       */
 /* ------------------------------------------------------------------ */
 
-/* FIX 2: PropertiesChanged sender is the unique name (:1.42), not the
- * well-known name. Match on unique_name instead. */
-static PlayerState *bus_find_player_by_unique(BusDaemon *b, const char *unique) {
+static PlayerState *bus_find_by_unique(BusDaemon *b, const char *unique) {
     for (int i = 0; i < b->n_players; i++)
         if (b->players[i].unique_name[0] && strcmp(b->players[i].unique_name, unique) == 0)
             return &b->players[i];
@@ -414,7 +448,6 @@ static PlayerState *bus_add_player(BusDaemon *b, const char *busname) {
     return p;
 }
 
-/* Resolve well-known name -> unique name via GetNameOwner and store it. */
 static void bus_resolve_unique(BusDaemon *b, PlayerState *p) {
     sd_bus_message *reply = NULL;
     sd_bus_error err = SD_BUS_ERROR_NULL;
@@ -433,15 +466,8 @@ static void bus_resolve_unique(BusDaemon *b, PlayerState *p) {
 static void bus_remove_player(BusDaemon *b, const char *busname) {
     for (int i = 0; i < b->n_players; i++) {
         if (strcmp(b->players[i].busname, busname) == 0) {
-            /* emit stopped event */
-            char json[512];
-            snprintf(json, sizeof(json),
-                     "{\"type\":\"player\",\"name\":\"%s\","
-                     "\"title\":\"\",\"artist\":\"\","
-                     "\"status\":\"Stopped\",\"volume\":0}\n",
-                     b->players[i].shortname);
-            eq_push(json);
-            char wb = WAKEUP_PLAYER;
+            push_player_event(b->players[i].shortname, "", "", "Stopped", 0.0);
+            char wb = WAKEUP_BYTE;
             ssize_t r = write(b->wakeup_fd, &wb, 1);
             (void)r;
             b->players[i] = b->players[--b->n_players];
@@ -451,33 +477,22 @@ static void bus_remove_player(BusDaemon *b, const char *busname) {
 }
 
 static void bus_emit_player(BusDaemon *b, PlayerState *p) {
-    char json[768];
-    /* sanitize title/artist for JSON */
-    char title[256], artist[256];
-    int ti = 0, ai = 0;
-    for (const char *c = p->title; *c && ti < 254; c++)
-        title[ti++] = (*c == '"' || *c == '\\') ? ' ' : *c;
-    for (const char *c = p->artist; *c && ai < 254; c++)
-        artist[ai++] = (*c == '"' || *c == '\\') ? ' ' : *c;
-    title[ti] = artist[ai] = '\0';
-
-    snprintf(json, sizeof(json),
-             "{\"type\":\"player\",\"name\":\"%s\","
-             "\"title\":\"%s\",\"artist\":\"%s\","
-             "\"status\":\"%s\",\"volume\":%.4f}\n",
-             p->shortname, title, artist, p->status, p->volume);
-
-    eq_push(json);
-    char wb = WAKEUP_PLAYER;
+    push_player_event(p->shortname, p->title, p->artist, p->status, p->volume);
+    char wb = WAKEUP_BYTE;
     ssize_t r = write(b->wakeup_fd, &wb, 1);
     (void)r;
 }
+
+/* ------------------------------------------------------------------ */
+/* Fetch player state from D-Bus                                        */
+/* ------------------------------------------------------------------ */
 
 static void bus_fetch_player_state(BusDaemon *b, PlayerState *p) {
     sd_bus_message *reply = NULL;
     sd_bus_error err = SD_BUS_ERROR_NULL;
     int r;
 
+    /* GetAll for status + volume */
     r = sd_bus_call_method(b->bus, p->busname, MPRIS_PATH, MPRIS_PROPS_IF, "GetAll", &err, &reply,
                            "s", MPRIS_PLAYER_IF);
     sd_bus_error_free(&err);
@@ -504,11 +519,10 @@ static void bus_fetch_player_state(BusDaemon *b, PlayerState *p) {
         sd_bus_message_exit_container(reply);
     }
     sd_bus_message_exit_container(reply);
-
 out:
     sd_bus_message_unref(reply);
 
-    /* fetch metadata separately */
+    /* Get Metadata separately */
     reply = NULL;
     r = sd_bus_call_method(b->bus, p->busname, MPRIS_PATH, MPRIS_PROPS_IF, "Get", &err, &reply,
                            "ss", MPRIS_PLAYER_IF, "Metadata");
@@ -554,7 +568,6 @@ out:
     }
     sd_bus_message_exit_container(reply);
     sd_bus_message_exit_container(reply);
-
 out2:
     sd_bus_message_unref(reply);
 }
@@ -571,8 +584,8 @@ static int on_properties_changed(sd_bus_message *m, void *userdata, sd_bus_error
     if (!sender)
         return 0;
 
-    /* FIX 2: sender is the unique name (:1.42), match on unique_name */
-    PlayerState *p = bus_find_player_by_unique(b, sender);
+    /* sender is the unique bus name (:1.42) */
+    PlayerState *p = bus_find_by_unique(b, sender);
     if (!p)
         return 0;
 
@@ -597,7 +610,6 @@ static int on_name_owner_changed(sd_bus_message *m, void *userdata, sd_bus_error
         return 0;
 
     if (strlen(new_owner) > 0 && strlen(old_owner) == 0) {
-        /* player appeared */
         PlayerState *p = bus_add_player(b, name);
         if (p) {
             bus_resolve_unique(b, p);
@@ -605,14 +617,13 @@ static int on_name_owner_changed(sd_bus_message *m, void *userdata, sd_bus_error
             bus_emit_player(b, p);
         }
     } else if (strlen(old_owner) > 0 && strlen(new_owner) == 0) {
-        /* player gone */
         bus_remove_player(b, name);
     }
     return 0;
 }
 
 /* ------------------------------------------------------------------ */
-/* D-Bus init — discover existing players                               */
+/* Discover existing players at startup                                 */
 /* ------------------------------------------------------------------ */
 
 static void bus_discover_players(BusDaemon *b) {
@@ -637,7 +648,6 @@ static void bus_discover_players(BusDaemon *b) {
         if (strncmp(bname, MPRIS_PREFIX, strlen(MPRIS_PREFIX)) != 0)
             continue;
 
-        /* check status */
         sd_bus_message *sreply = NULL;
         sd_bus_error serr = SD_BUS_ERROR_NULL;
         r = sd_bus_call_method(b->bus, bname, MPRIS_PATH, MPRIS_PROPS_IF, "Get", &serr, &sreply,
@@ -685,7 +695,6 @@ int daemon_run(void) {
         return -1;
     }
 
-    /* PipeWire init */
     pw_init(NULL, NULL);
 
     PwDaemon pw = {0};
@@ -714,19 +723,12 @@ int daemon_run(void) {
     }
 
     pw.registry = pw_core_get_registry(pw.core, PW_VERSION_REGISTRY, 0);
-    pw_core_add_listener(pw.core, &pw.core_listener,
-                         &(struct pw_core_events){
-                             PW_VERSION_CORE_EVENTS,
-                             .error = NULL,
-                             .done = NULL,
-                         },
-                         NULL);
     pw_registry_add_listener(pw.registry, &pw.registry_listener, &registry_events_daemon, &pw);
 
     pw_thread_loop_unlock(pw.loop);
     pw_thread_loop_start(pw.loop);
 
-    /* D-Bus init */
+    /* D-Bus */
     BusDaemon bus = {0};
     bus.wakeup_fd = wakeup[1];
 
@@ -736,7 +738,7 @@ int daemon_run(void) {
         return -1;
     }
 
-    sd_bus_match_signal(bus.bus, &bus.props_slot, NULL, "/org/mpris/MediaPlayer2",
+    sd_bus_match_signal(bus.bus, &bus.props_slot, NULL, MPRIS_PATH,
                         "org.freedesktop.DBus.Properties", "PropertiesChanged",
                         on_properties_changed, &bus);
     sd_bus_match_signal(bus.bus, &bus.name_slot, DBUS_NAME, DBUS_PATH, DBUS_NAME,
@@ -744,7 +746,7 @@ int daemon_run(void) {
 
     bus_discover_players(&bus);
 
-    /* Socket server */
+    /* Socket */
     int server_fd = sock_server_init();
     if (server_fd < 0)
         return -1;
@@ -760,19 +762,15 @@ int daemon_run(void) {
     }
 
     struct epoll_event ev = {0};
-
-    /* wakeup read end */
     ev.events = EPOLLIN;
     ev.data.fd = wakeup[0];
     epoll_ctl(epfd, EPOLL_CTL_ADD, wakeup[0], &ev);
 
-    /* d-bus fd */
     int bus_fd = sd_bus_get_fd(bus.bus);
     ev.events = EPOLLIN;
     ev.data.fd = bus_fd;
     epoll_ctl(epfd, EPOLL_CTL_ADD, bus_fd, &ev);
 
-    /* server socket */
     ev.events = EPOLLIN;
     ev.data.fd = server_fd;
     epoll_ctl(epfd, EPOLL_CTL_ADD, server_fd, &ev);
@@ -795,63 +793,67 @@ int daemon_run(void) {
             int fd = events[i].data.fd;
 
             if (fd == wakeup[0]) {
-                /* drain wakeup bytes */
                 char buf[64];
                 ssize_t nr = read(wakeup[0], buf, sizeof(buf));
                 (void)nr;
-
-                /* flush event queue to all clients */
-                char json[512];
+                char json[EVENT_JSON_SIZE];
                 while (eq_pop(json, sizeof(json)))
                     sock_broadcast(clients, &n_clients, json);
 
             } else if (fd == bus_fd) {
-                /* process all pending d-bus messages */
                 while (sd_bus_process(bus.bus, NULL) > 0) {
                 }
 
             } else if (fd == server_fd) {
-                /* accept new client */
                 int cfd = sock_server_accept(server_fd);
                 if (cfd >= 0 && n_clients < MAX_CLIENTS) {
                     clients[n_clients++] = cfd;
 
-                    /* send current state of all sinks to new client */
+                    /* send current state to new client */
                     pw_thread_loop_lock(pw.loop);
                     for (int j = 0; j < pw.n_sinks; j++) {
                         DaemonSink *sk = &pw.sinks[j];
-                        char sjson[320];
-                        snprintf(sjson, sizeof(sjson),
-                                 "{\"type\":\"sink\",\"name\":\"%s\",\"level\":%.4f,"
-                                 "\"muted\":%s,\"icon\":\"%s\",\"default\":%s}\n",
-                                 sk->name, sk->level, sk->muted ? "true" : "false",
-                                 volume_icon(sk->level, sk->muted),
-                                 strcmp(sk->name, pw.default_name) == 0 ? "true" : "false");
-                        int tmp_clients[] = {cfd};
-                        int tmp_n = 1;
-                        sock_broadcast(tmp_clients, &tmp_n, sjson);
+                        bool is_def = strcmp(sk->name, pw.default_name) == 0;
+                        /* build directly to avoid eq path */
+                        cJSON *root = cJSON_CreateObject();
+                        cJSON_AddStringToObject(root, "type", "sink");
+                        cJSON_AddStringToObject(root, "name", sk->name);
+                        cJSON_AddNumberToObject(root, "level", (double)sk->level);
+                        cJSON_AddBoolToObject(root, "muted", sk->muted);
+                        cJSON_AddStringToObject(root, "icon", volume_icon(sk->level, sk->muted));
+                        cJSON_AddBoolToObject(root, "default", is_def);
+                        char *str = cJSON_PrintUnformatted(root);
+                        cJSON_Delete(root);
+                        if (str) {
+                            char line[EVENT_JSON_SIZE];
+                            snprintf(line, sizeof(line), "%s\n", str);
+                            cJSON_free(str);
+                            int tmp_c[] = {cfd};
+                            int tmp_n = 1;
+                            sock_broadcast(tmp_c, &tmp_n, line);
+                        }
                     }
                     pw_thread_loop_unlock(pw.loop);
 
                     for (int j = 0; j < bus.n_players; j++) {
-                        char pjson[768];
                         PlayerState *p = &bus.players[j];
-                        /* sanitize for JSON */
-                        char title[256], artist[256];
-                        int ti = 0, ai = 0;
-                        for (const char *c = p->title; *c && ti < 254; c++)
-                            title[ti++] = (*c == '"' || *c == '\\') ? ' ' : *c;
-                        for (const char *c = p->artist; *c && ai < 254; c++)
-                            artist[ai++] = (*c == '"' || *c == '\\') ? ' ' : *c;
-                        title[ti] = artist[ai] = '\0';
-                        snprintf(pjson, sizeof(pjson),
-                                 "{\"type\":\"player\",\"name\":\"%s\","
-                                 "\"title\":\"%s\",\"artist\":\"%s\","
-                                 "\"status\":\"%s\",\"volume\":%.4f}\n",
-                                 p->shortname, title, artist, p->status, p->volume);
-                        int tmp_clients[] = {cfd};
-                        int tmp_n = 1;
-                        sock_broadcast(tmp_clients, &tmp_n, pjson);
+                        cJSON *root = cJSON_CreateObject();
+                        cJSON_AddStringToObject(root, "type", "player");
+                        cJSON_AddStringToObject(root, "name", p->shortname);
+                        cJSON_AddStringToObject(root, "title", p->title);
+                        cJSON_AddStringToObject(root, "artist", p->artist);
+                        cJSON_AddStringToObject(root, "status", p->status);
+                        cJSON_AddNumberToObject(root, "volume", p->volume);
+                        char *str = cJSON_PrintUnformatted(root);
+                        cJSON_Delete(root);
+                        if (str) {
+                            char line[EVENT_JSON_SIZE];
+                            snprintf(line, sizeof(line), "%s\n", str);
+                            cJSON_free(str);
+                            int tmp_c[] = {cfd};
+                            int tmp_n = 1;
+                            sock_broadcast(tmp_c, &tmp_n, line);
+                        }
                     }
                 }
             }
@@ -860,7 +862,6 @@ int daemon_run(void) {
 
     fprintf(stderr, "nyq: daemon stopping\n");
 
-    /* cleanup */
     for (int i = 0; i < n_clients; i++)
         close(clients[i]);
     close(server_fd);
@@ -888,6 +889,7 @@ int daemon_run(void) {
         spa_hook_remove(&pw.metadata_listener);
         pw_proxy_destroy((struct pw_proxy *)pw.metadata);
     }
+    spa_hook_remove(&pw.registry_listener);
     pw_proxy_destroy((struct pw_proxy *)pw.registry);
     pw_core_disconnect(pw.core);
     pw_thread_loop_unlock(pw.loop);
