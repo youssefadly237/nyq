@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
@@ -167,6 +169,8 @@ typedef struct {
     pid_t pid;
     char name[128];
     char node_name[256];
+    char title[256];
+    char artist[256];
     struct pw_node *node;
     struct spa_hook node_listener;
     float level;
@@ -206,12 +210,70 @@ static PwDaemon *g_pw = NULL;
 static void pw_bind_sink_device(PwDaemon *d, DaemonSink *sink);
 static void pw_subscribe_sink(DaemonSink *sink);
 static void pw_subscribe_stream(DaemonStream *stream);
-static void push_stream_player_event(pid_t pid, const char *name, double volume, bool muted);
+static void push_stream_player_event(DaemonStream *stream, double volume, bool muted);
 
 static void notify_main_thread(int fd) {
     char b = WAKEUP_BYTE;
     ssize_t r = write(fd, &b, 1);
     (void)r;
+}
+
+static DaemonPwClient *pw_find_client(PwDaemon *d, uint32_t id) {
+    for (int i = 0; i < d->n_pw_clients; i++) {
+        if (d->clients[i].id == id)
+            return &d->clients[i];
+    }
+    return NULL;
+}
+
+static void pw_update_stream_metadata(PwDaemon *d, DaemonStream *stream, const struct spa_dict *props) {
+    const char *app_name = props ? spa_dict_lookup(props, PW_KEY_APP_NAME) : NULL;
+    const char *process_binary = props ? spa_dict_lookup(props, PW_KEY_APP_PROCESS_BINARY) : NULL;
+    const char *app_id = props ? spa_dict_lookup(props, PW_KEY_APP_ID) : NULL;
+    const char *media_name = props ? spa_dict_lookup(props, PW_KEY_MEDIA_NAME) : NULL;
+    const char *media_title = props ? spa_dict_lookup(props, PW_KEY_MEDIA_TITLE) : NULL;
+    const char *media_artist = props ? spa_dict_lookup(props, PW_KEY_MEDIA_ARTIST) : NULL;
+    const char *pid_str = props ? spa_dict_lookup(props, PW_KEY_APP_PROCESS_ID) : NULL;
+
+    if (pid_str && stream->pid == 0) {
+        pid_t new_pid = (pid_t)strtol(pid_str, NULL, 10);
+        if (new_pid > 0)
+            stream->pid = new_pid;
+    }
+
+    DaemonPwClient *client = stream->client_id ? pw_find_client(d, stream->client_id) : NULL;
+    if (!app_name && client && client->app_name[0])
+        app_name = client->app_name;
+    if (!process_binary && client && client->process_binary[0])
+        process_binary = client->process_binary;
+    if (!app_id && client && client->app_id[0])
+        app_id = client->app_id;
+
+    const char *src;
+    if (app_name && app_name[0])
+        src = app_name;
+    else if (process_binary && process_binary[0])
+        src = process_binary;
+    else if (app_id && app_id[0])
+        src = app_id;
+    else if (media_name && media_name[0])
+        src = media_name;
+    else
+        src = stream->node_name;
+
+    size_t i = 0;
+    for (; src[i] && i + 1 < sizeof(stream->name); i++)
+        stream->name[i] = (char)tolower((unsigned char)src[i]);
+    stream->name[i] = '\0';
+    if (i == 0)
+        snprintf(stream->name, sizeof(stream->name), "%s", "player");
+
+    if (media_title && media_title[0]) {
+        snprintf(stream->title, sizeof(stream->title), "%s", media_title);
+    }
+    if (media_artist && media_artist[0]) {
+        snprintf(stream->artist, sizeof(stream->artist), "%s", media_artist);
+    }
 }
 
 /* Device param callback */
@@ -246,7 +308,7 @@ static const struct pw_device_events device_events_daemon = {
     .param = on_device_param_daemon,
 };
 
-/* Node param callback */
+/* Sink node param callback */
 
 static void on_node_param_daemon(void *data, int seq, uint32_t id, uint32_t index, uint32_t next,
                                  const struct spa_pod *param) {
@@ -289,7 +351,6 @@ static void on_node_param_daemon(void *data, int seq, uint32_t id, uint32_t inde
 
     bool is_default = strcmp(sink->name, g_pw->default_name) == 0;
     push_sink_event(sink->name, sink->level, sink->muted, is_default);
-
     notify_main_thread(g_pw->wakeup_fd);
 }
 
@@ -297,6 +358,8 @@ static const struct pw_node_events node_events_daemon = {
     PW_VERSION_NODE_EVENTS,
     .param = on_node_param_daemon,
 };
+
+/* Stream node callbacks */
 
 static void on_stream_param_daemon(void *data, int seq, uint32_t id, uint32_t index, uint32_t next,
                                    const struct spa_pod *param) {
@@ -337,12 +400,24 @@ static void on_stream_param_daemon(void *data, int seq, uint32_t id, uint32_t in
     if (!g_pw)
         return;
 
-    push_stream_player_event(stream->pid, stream->name, (double)stream->level, stream->muted);
+    push_stream_player_event(stream, (double)stream->level, stream->muted);
     notify_main_thread(g_pw->wakeup_fd);
+}
+
+/* Re-run name resolution whenever PipeWire delivers updated node props.
+ * This fires after on_global_daemon, so late-arriving application.name
+ * values (e.g. Spotify's "audio-src" node) get fixed up before any
+ * volume param callbacks fire. */
+static void on_stream_info_daemon(void *data, const struct pw_node_info *info) {
+    DaemonStream *stream = data;
+    if (!info || !info->props || !g_pw)
+        return;
+    pw_update_stream_metadata(g_pw, stream, info->props);
 }
 
 static const struct pw_node_events stream_node_events_daemon = {
     PW_VERSION_NODE_EVENTS,
+    .info = on_stream_info_daemon,
     .param = on_stream_param_daemon,
 };
 
@@ -363,7 +438,6 @@ static int on_metadata_property_daemon(void *data, uint32_t subject, const char 
         return 0;
 
     snprintf(d->default_name, sizeof(d->default_name), "%s", new_name);
-
     push_sink_switch_event(new_name);
 
     /* emit new default's current state */
@@ -467,7 +541,6 @@ static void on_global_daemon(void *data, uint32_t id, uint32_t permissions, cons
             memmove(client->process_binary, process_binary, n);
             client->process_binary[n] = '\0';
         }
-
         return;
     }
 
@@ -487,25 +560,18 @@ static void on_global_daemon(void *data, uint32_t id, uint32_t permissions, cons
 
             const char *client_str = spa_dict_lookup(props, PW_KEY_CLIENT_ID);
             stream->client_id = client_str ? (uint32_t)strtoul(client_str, NULL, 10) : 0;
-            {
-                const char *s = node_name ? node_name : "player";
-                size_t n = strlen(s);
-                if (n >= sizeof(stream->node_name))
-                    n = sizeof(stream->node_name) - 1;
-                memmove(stream->node_name, s, n);
-                stream->node_name[n] = '\0';
-            }
+
+            const char *s = node_name ? node_name : "player";
+            size_t n = strlen(s);
+            if (n >= sizeof(stream->node_name))
+                n = sizeof(stream->node_name) - 1;
+            memmove(stream->node_name, s, n);
+            stream->node_name[n] = '\0';
 
             const char *pid_str = spa_dict_lookup(props, PW_KEY_APP_PROCESS_ID);
             stream->pid = pid_str ? (pid_t)strtol(pid_str, NULL, 10) : 0;
 
-            {
-                size_t n = strlen(stream->node_name);
-                if (n >= sizeof(stream->name))
-                    n = sizeof(stream->name) - 1;
-                memmove(stream->name, stream->node_name, n);
-                stream->name[n] = '\0';
-            }
+            pw_update_stream_metadata(d, stream, props);
 
             stream->node =
                 pw_registry_bind(d->registry, id, PW_TYPE_INTERFACE_Node, PW_VERSION_NODE, 0);
@@ -530,13 +596,12 @@ static void on_global_daemon(void *data, uint32_t id, uint32_t permissions, cons
 
         const char *dev_str = spa_dict_lookup(props, "device.id");
         sink->device_id = dev_str ? (uint32_t)strtoul(dev_str, NULL, 10) : 0;
-        {
-            size_t n = strlen(node_name);
-            if (n >= sizeof(sink->name))
-                n = sizeof(sink->name) - 1;
-            memmove(sink->name, node_name, n);
-            sink->name[n] = '\0';
-        }
+
+        size_t n = strlen(node_name);
+        if (n >= sizeof(sink->name))
+            n = sizeof(sink->name) - 1;
+        memmove(sink->name, node_name, n);
+        sink->name[n] = '\0';
 
         sink->node = pw_registry_bind(d->registry, id, PW_TYPE_INTERFACE_Node, PW_VERSION_NODE, 0);
         if (sink->node)
@@ -549,6 +614,7 @@ static void on_global_daemon(void *data, uint32_t id, uint32_t permissions, cons
 
 static void on_global_remove_daemon(void *data, uint32_t id) {
     PwDaemon *d = data;
+
     for (int i = 0; i < d->n_sinks; i++) {
         if (d->sinks[i].id == id) {
             if (d->sinks[i].node) {
@@ -602,6 +668,7 @@ typedef struct {
     double volume;
     bool has_stream_muted;
     bool stream_muted;
+    bool needs_fetch; /* set by PW thread when metadata is missing; consumed on main thread */
 } PlayerState;
 
 typedef struct BusDaemon {
@@ -628,40 +695,79 @@ static PlayerState *bus_find_by_unique(BusDaemon *b, const char *unique) {
 static PlayerState *bus_find_by_pid(BusDaemon *b, pid_t pid) {
     if (pid <= 0)
         return NULL;
-    for (int i = 0; i < b->n_players; i++) {
+    for (int i = 0; i < b->n_players; i++)
         if (b->players[i].pid == pid)
+            return &b->players[i];
+    return NULL;
+}
+
+static PlayerState *bus_find_by_name(BusDaemon *b, const char *name) {
+    if (!name || !name[0])
+        return NULL;
+    for (int i = 0; i < b->n_players; i++) {
+        const char *player_name = b->players[i].shortname;
+        if (strcasecmp(player_name, name) == 0)
+            return &b->players[i];
+        size_t plen = strlen(player_name);
+        if (plen > 0 && strncasecmp(name, player_name, plen) == 0 && name[plen] == '.')
+            return &b->players[i];
+        size_t nlen = strlen(name);
+        if (nlen > 0 && strncasecmp(player_name, name, nlen) == 0 && player_name[nlen] == '.')
             return &b->players[i];
     }
     return NULL;
 }
 
-static void push_stream_player_event(pid_t pid, const char *name, double volume, bool muted) {
+/* Called from the PW thread. Looks up the MPRIS player by pid first,
+ * then falls back to name matching, copies whatever metadata we already
+ * have, and marks needs_fetch if the title is still empty so the main
+ * thread can do a proper D-Bus round-trip. */
+static void push_stream_player_event(DaemonStream *stream, double volume, bool muted) {
     char out_name[128] = {0};
     char title[256] = {0};
     char artist[256] = {0};
     char status[32] = "Playing";
     bool matched = false;
 
+    pid_t pid = stream->pid;
+    const char *name = stream->name;
+    uint32_t client_id = stream->client_id;
+
     snprintf(out_name, sizeof(out_name), "%s", name && name[0] ? name : "player");
+    snprintf(title, sizeof(title), "%s", stream->title);
+    snprintf(artist, sizeof(artist), "%s", stream->artist);
 
     pthread_mutex_lock(&g_bus_lock);
-    if (g_bus && pid > 0) {
-        PlayerState *p = bus_find_by_pid(g_bus, pid);
+    if (g_bus) {
+        PlayerState *p = NULL;
+
+        if (pid > 0)
+            p = bus_find_by_pid(g_bus, pid);
+        if (!p && name && name[0])
+            p = bus_find_by_name(g_bus, name);
+        if (!p && client_id > 0 && g_pw) {
+            DaemonPwClient *client = pw_find_client(g_pw, client_id);
+            if (client && client->app_name[0])
+                p = bus_find_by_name(g_bus, client->app_name);
+        }
         if (p) {
             snprintf(out_name, sizeof(out_name), "%s", p->shortname);
-            snprintf(title, sizeof(title), "%s", p->title);
-            snprintf(artist, sizeof(artist), "%s", p->artist);
+            if (p->title[0]) {
+                snprintf(title, sizeof(title), "%s", p->title);
+                snprintf(artist, sizeof(artist), "%s", p->artist);
+            }
             snprintf(status, sizeof(status), "%s", p->status[0] ? p->status : "Stopped");
             p->volume = volume;
             p->has_stream_muted = true;
             p->stream_muted = muted;
+            if (!p->title[0])
+                p->needs_fetch = true;
             matched = true;
         }
     }
     pthread_mutex_unlock(&g_bus_lock);
 
-    push_player_event_full(out_name, matched ? title : "", matched ? artist : "",
-                           matched ? status : "Playing", volume, true, muted);
+    push_player_event_full(out_name, title, artist, matched ? status : "Playing", volume, true, muted);
 }
 
 static PlayerState *bus_add_player(BusDaemon *b, const char *busname) {
@@ -671,7 +777,7 @@ static PlayerState *bus_add_player(BusDaemon *b, const char *busname) {
     memset(p, 0, sizeof(*p));
     snprintf(p->busname, sizeof(p->busname), "%s", busname);
     snprintf(p->shortname, sizeof(p->shortname), "%s", busname + strlen(MPRIS_PREFIX));
-    snprintf(p->status, sizeof(p->status), "Stopped");
+    snprintf(p->status, sizeof(p->status), "%s", "Stopped");
     return p;
 }
 
@@ -806,6 +912,22 @@ out2:
     sd_bus_message_unref(reply);
 }
 
+/* If any player was matched by the PW thread but had no title yet,
+ * fetch full metadata now and re-emit.  Called on the main thread only,
+ * after draining the event queue, so D-Bus calls are safe here. */
+static void bus_flush_pending_fetches(BusDaemon *b) {
+    pthread_mutex_lock(&g_bus_lock);
+    for (int i = 0; i < b->n_players; i++) {
+        PlayerState *p = &b->players[i];
+        if (!p->needs_fetch)
+            continue;
+        p->needs_fetch = false;
+        bus_fetch_player_state(b, p);
+        bus_emit_player(b, p); /* pushes to eq; next wakeup will broadcast it */
+    }
+    pthread_mutex_unlock(&g_bus_lock);
+}
+
 /* D-Bus signal handlers */
 
 static int on_properties_changed(sd_bus_message *m, void *userdata, sd_bus_error *err) {
@@ -903,6 +1025,7 @@ static void bus_discover_players(BusDaemon *b) {
         PlayerState *p = bus_add_player(b, bname);
         if (p) {
             bus_resolve_unique(b, p);
+            bus_resolve_pid(b, p);
             bus_fetch_player_state(b, p);
         }
         pthread_mutex_unlock(&g_bus_lock);
@@ -1039,6 +1162,12 @@ int daemon_run(void) {
                 char json[EVENT_JSON_SIZE];
                 while (eq_pop(json, sizeof(json)))
                     sock_broadcast(clients, &n_clients, json);
+                /* After draining the queue, do any deferred D-Bus fetches.
+                 * bus_emit_player will write to the wakeup pipe again, so
+                 * the freshly-fetched metadata gets broadcast on the next
+                 * iteration - no busy loop because needs_fetch is cleared
+                 * before the fetch, so the second wakeup finds nothing to do. */
+                bus_flush_pending_fetches(&bus);
 
             } else if (fd == bus_fd) {
                 while (sd_bus_process(bus.bus, NULL) > 0) {
@@ -1049,12 +1178,11 @@ int daemon_run(void) {
                 if (cfd >= 0 && n_clients < MAX_CLIENTS) {
                     clients[n_clients++] = cfd;
 
-                    /* send current state to new client */
+                    /* Send current state to the newly connected client */
                     pw_thread_loop_lock(pw.loop);
                     for (int j = 0; j < pw.n_sinks; j++) {
                         DaemonSink *sk = &pw.sinks[j];
                         bool is_def = strcmp(sk->name, pw.default_name) == 0;
-                        /* build directly to avoid eq path */
                         cJSON *root = cJSON_CreateObject();
                         cJSON_AddStringToObject(root, "type", "sink");
                         cJSON_AddStringToObject(root, "name", sk->name);
