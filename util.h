@@ -2,6 +2,28 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+
+#include <systemd/sd-journal.h>
+#include <syslog.h>
+
+#define log_err(fmt, ...) do { \
+    fprintf(stderr, "nyq: " fmt "\n", ##__VA_ARGS__); \
+    sd_journal_print(LOG_ERR, fmt, ##__VA_ARGS__); \
+} while(0)
+
+#define log_warn(fmt, ...) do { \
+    fprintf(stderr, "nyq: " fmt "\n", ##__VA_ARGS__); \
+    sd_journal_print(LOG_WARNING, fmt, ##__VA_ARGS__); \
+} while(0)
+
+#define log_info(fmt, ...) do { \
+    fprintf(stderr, "nyq: " fmt "\n", ##__VA_ARGS__); \
+    sd_journal_print(LOG_INFO, fmt, ##__VA_ARGS__); \
+} while(0)
 
 /* Volume math
  * PipeWire wire format: linear (0.0–1.0)

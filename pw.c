@@ -259,6 +259,12 @@ static void on_global(void *data, uint32_t id, uint32_t permissions, const char 
 
 static void on_global_remove(void *data, uint32_t id) {
     PwState *s = data;
+    for (int i = 0; i < s->n_sinks; i++) {
+        if (s->sinks[i].id == id) {
+            s->sinks[i] = s->sinks[--s->n_sinks];
+            break;
+        }
+    }
     if (id == s->target_id) {
         fprintf(stderr, "nyq: default sink removed\n");
         s->error = -1;

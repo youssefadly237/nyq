@@ -63,6 +63,12 @@ static void eq_push(const char *json) {
     if (next != eq.head) {
         snprintf(eq.items[eq.tail].json, sizeof(eq.items[eq.tail].json), "%s", json);
         eq.tail = next;
+    } else {
+        static bool warned = false;
+        if (!warned) {
+            log_warn("event queue full, dropping events");
+            warned = true;
+        }
     }
     pthread_mutex_unlock(&eq.lock);
 }
@@ -738,8 +744,7 @@ static void push_stream_player_event(DaemonStream *stream, double volume, bool m
             p = bus_find_by_name(g_bus, client->app_name);
         if (p) {
             snprintf(out_name, sizeof(out_name), "%s", p->shortname);
-            snprintf(out_name, sizeof(out_name), "%s", p->shortname);
-            if (p->title[0]) {
+            if (!stream->title[0] && p->title[0]) {
                 snprintf(title, sizeof(title), "%s", p->title);
                 snprintf(artist, sizeof(artist), "%s", p->artist);
             }
@@ -1036,7 +1041,7 @@ static void on_signal(int sig) {
 int daemon_run(void) {
     int wakeup[2];
     if (pipe(wakeup) < 0) {
-        perror("nyq: pipe");
+        log_err("pipe: %s", strerror(errno));
         return -1;
     }
 
@@ -1048,13 +1053,13 @@ int daemon_run(void) {
 
     pw.loop = pw_thread_loop_new("nyq-pw", NULL);
     if (!pw.loop) {
-        fprintf(stderr, "nyq: pw_thread_loop_new failed\n");
+        log_err("pw_thread_loop_new failed");
         return -1;
     }
 
     pw.ctx = pw_context_new(pw_thread_loop_get_loop(pw.loop), NULL, 0);
     if (!pw.ctx) {
-        fprintf(stderr, "nyq: pw_context_new failed\n");
+        log_err("pw_context_new failed");
         return -1;
     }
 
@@ -1063,7 +1068,7 @@ int daemon_run(void) {
     pw.core = pw_context_connect(pw.ctx, NULL, 0);
     if (!pw.core) {
         pw_thread_loop_unlock(pw.loop);
-        fprintf(stderr, "nyq: pw_context_connect failed\n");
+        log_err("pw_context_connect failed");
         return -1;
     }
 
@@ -1082,7 +1087,7 @@ int daemon_run(void) {
 
     int r = sd_bus_open_user(&bus.bus);
     if (r < 0) {
-        fprintf(stderr, "nyq: sd_bus_open_user failed: %s\n", strerror(-r));
+        log_err("sd_bus_open_user failed: %s", strerror(-r));
         pthread_mutex_lock(&g_bus_lock);
         g_bus = NULL;
         pthread_mutex_unlock(&g_bus_lock);
@@ -1130,7 +1135,7 @@ int daemon_run(void) {
     signal(SIGINT, on_signal);
     signal(SIGQUIT, on_signal);
 
-    fprintf(stderr, "nyq: daemon started\n");
+    log_info("daemon started");
 
     struct epoll_event events[16];
     while (g_running) {
@@ -1221,7 +1226,7 @@ int daemon_run(void) {
         }
     }
 
-    fprintf(stderr, "nyq: daemon stopping\n");
+    log_info("daemon stopping");
 
     for (int i = 0; i < n_clients; i++)
         close(clients[i]);
