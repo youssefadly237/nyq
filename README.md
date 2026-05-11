@@ -84,3 +84,6 @@ All events are JSON objects terminated by a newline.
 ```
 
 `level` is perceptual (cubic root of linear), in the range `0.0–1.0`. `icon` is a freedesktop icon name.
+
+`muted` field goes crazy, for spotify it just shows 0 vol instead of muted, brave
+just show status as stopped, so it is unstable
