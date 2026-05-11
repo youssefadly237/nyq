@@ -5,7 +5,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
@@ -165,6 +164,7 @@ typedef struct {
 typedef struct {
     uint32_t id;
     uint32_t client_id;
+    pid_t pid;
     char name[128];
     char node_name[256];
     struct pw_node *node;
@@ -206,77 +206,12 @@ static PwDaemon *g_pw = NULL;
 static void pw_bind_sink_device(PwDaemon *d, DaemonSink *sink);
 static void pw_subscribe_sink(DaemonSink *sink);
 static void pw_subscribe_stream(DaemonStream *stream);
-static void push_stream_player_event(const char *name, double volume, bool muted);
+static void push_stream_player_event(pid_t pid, const char *name, double volume, bool muted);
 
 static void notify_main_thread(int fd) {
     char b = WAKEUP_BYTE;
     ssize_t r = write(fd, &b, 1);
     (void)r;
-}
-
-static DaemonPwClient *pw_find_client(PwDaemon *d, uint32_t id) {
-    for (int i = 0; i < d->n_pw_clients; i++) {
-        if (d->clients[i].id == id)
-            return &d->clients[i];
-    }
-    return NULL;
-}
-
-static void normalize_player_name(const char *src, char *buf, size_t len) {
-    if (len == 0)
-        return;
-
-    if (!src || !src[0])
-        src = "player";
-
-    const char *base = strrchr(src, '/');
-    if (base && base[1])
-        src = base + 1;
-
-    size_t j = 0;
-    bool last_sep = false;
-    for (size_t i = 0; src[i] && j + 1 < len; i++) {
-        unsigned char ch = (unsigned char)src[i];
-        if (isalnum(ch) || ch == '.' || ch == '_' || ch == '-') {
-            buf[j++] = (char)tolower(ch);
-            last_sep = false;
-        } else if (!last_sep && j > 0) {
-            buf[j++] = '-';
-            last_sep = true;
-        }
-    }
-
-    while (j > 0 && buf[j - 1] == '-')
-        j--;
-
-    if (j == 0) {
-        snprintf(buf, len, "%s", "player");
-    } else {
-        buf[j] = '\0';
-    }
-}
-
-static void pw_update_stream_name(PwDaemon *d, DaemonStream *stream, const struct spa_dict *props) {
-    const char *process_binary = props ? spa_dict_lookup(props, PW_KEY_APP_PROCESS_BINARY) : NULL;
-    const char *app_id = props ? spa_dict_lookup(props, PW_KEY_APP_ID) : NULL;
-    const char *app_name = props ? spa_dict_lookup(props, PW_KEY_APP_NAME) : NULL;
-    const char *media_name = props ? spa_dict_lookup(props, PW_KEY_MEDIA_NAME) : NULL;
-
-    DaemonPwClient *client = stream->client_id ? pw_find_client(d, stream->client_id) : NULL;
-    if (!process_binary && client && client->process_binary[0])
-        process_binary = client->process_binary;
-    if (!app_id && client && client->app_id[0])
-        app_id = client->app_id;
-    if (!app_name && client && client->app_name[0])
-        app_name = client->app_name;
-
-    const char *src = process_binary ? process_binary
-                      : app_id       ? app_id
-                      : app_name     ? app_name
-                      : media_name   ? media_name
-                                     : stream->node_name;
-
-    normalize_player_name(src, stream->name, sizeof(stream->name));
 }
 
 /* Device param callback */
@@ -402,7 +337,7 @@ static void on_stream_param_daemon(void *data, int seq, uint32_t id, uint32_t in
     if (!g_pw)
         return;
 
-    push_stream_player_event(stream->name, (double)stream->level, stream->muted);
+    push_stream_player_event(stream->pid, stream->name, (double)stream->level, stream->muted);
     notify_main_thread(g_pw->wakeup_fd);
 }
 
@@ -511,17 +446,28 @@ static void on_global_daemon(void *data, uint32_t id, uint32_t permissions, cons
         const char *app_name = spa_dict_lookup(props, PW_KEY_APP_NAME);
         const char *app_id = spa_dict_lookup(props, PW_KEY_APP_ID);
         const char *process_binary = spa_dict_lookup(props, PW_KEY_APP_PROCESS_BINARY);
-        if (app_name)
-            snprintf(client->app_name, sizeof(client->app_name), "%s", app_name);
-        if (app_id)
-            snprintf(client->app_id, sizeof(client->app_id), "%s", app_id);
-        if (process_binary)
-            snprintf(client->process_binary, sizeof(client->process_binary), "%s", process_binary);
-
-        for (int i = 0; i < d->n_streams; i++) {
-            if (d->streams[i].client_id == id)
-                pw_update_stream_name(d, &d->streams[i], NULL);
+        if (app_name) {
+            size_t n = strlen(app_name);
+            if (n >= sizeof(client->app_name))
+                n = sizeof(client->app_name) - 1;
+            memmove(client->app_name, app_name, n);
+            client->app_name[n] = '\0';
         }
+        if (app_id) {
+            size_t n = strlen(app_id);
+            if (n >= sizeof(client->app_id))
+                n = sizeof(client->app_id) - 1;
+            memmove(client->app_id, app_id, n);
+            client->app_id[n] = '\0';
+        }
+        if (process_binary) {
+            size_t n = strlen(process_binary);
+            if (n >= sizeof(client->process_binary))
+                n = sizeof(client->process_binary) - 1;
+            memmove(client->process_binary, process_binary, n);
+            client->process_binary[n] = '\0';
+        }
+
         return;
     }
 
@@ -541,9 +487,25 @@ static void on_global_daemon(void *data, uint32_t id, uint32_t permissions, cons
 
             const char *client_str = spa_dict_lookup(props, PW_KEY_CLIENT_ID);
             stream->client_id = client_str ? (uint32_t)strtoul(client_str, NULL, 10) : 0;
-            snprintf(stream->node_name, sizeof(stream->node_name), "%s",
-                     node_name ? node_name : "player");
-            pw_update_stream_name(d, stream, props);
+            {
+                const char *s = node_name ? node_name : "player";
+                size_t n = strlen(s);
+                if (n >= sizeof(stream->node_name))
+                    n = sizeof(stream->node_name) - 1;
+                memmove(stream->node_name, s, n);
+                stream->node_name[n] = '\0';
+            }
+
+            const char *pid_str = spa_dict_lookup(props, PW_KEY_APP_PROCESS_ID);
+            stream->pid = pid_str ? (pid_t)strtol(pid_str, NULL, 10) : 0;
+
+            {
+                size_t n = strlen(stream->node_name);
+                if (n >= sizeof(stream->name))
+                    n = sizeof(stream->name) - 1;
+                memmove(stream->name, stream->node_name, n);
+                stream->name[n] = '\0';
+            }
 
             stream->node =
                 pw_registry_bind(d->registry, id, PW_TYPE_INTERFACE_Node, PW_VERSION_NODE, 0);
@@ -568,7 +530,13 @@ static void on_global_daemon(void *data, uint32_t id, uint32_t permissions, cons
 
         const char *dev_str = spa_dict_lookup(props, "device.id");
         sink->device_id = dev_str ? (uint32_t)strtoul(dev_str, NULL, 10) : 0;
-        snprintf(sink->name, sizeof(sink->name), "%s", node_name);
+        {
+            size_t n = strlen(node_name);
+            if (n >= sizeof(sink->name))
+                n = sizeof(sink->name) - 1;
+            memmove(sink->name, node_name, n);
+            sink->name[n] = '\0';
+        }
 
         sink->node = pw_registry_bind(d->registry, id, PW_TYPE_INTERFACE_Node, PW_VERSION_NODE, 0);
         if (sink->node)
@@ -626,6 +594,7 @@ static const struct pw_registry_events registry_events_daemon = {
 typedef struct {
     char busname[128];
     char unique_name[64];
+    pid_t pid;
     char shortname[64];
     char title[256];
     char artist[256];
@@ -656,41 +625,17 @@ static PlayerState *bus_find_by_unique(BusDaemon *b, const char *unique) {
     return NULL;
 }
 
-static void player_match_key(const char *name, char *buf, size_t len) {
-    if (len == 0)
-        return;
-
-    size_t j = 0;
-    for (size_t i = 0; name && name[i] && j + 1 < len; i++) {
-        unsigned char ch = (unsigned char)name[i];
-        if (!isalnum(ch))
-            break;
-        buf[j++] = (char)tolower(ch);
-    }
-    buf[j] = '\0';
-}
-
-static bool player_names_match(const char *a, const char *b) {
-    if (!a || !b || !a[0] || !b[0])
-        return false;
-    if (strcasestr(a, b) || strcasestr(b, a))
-        return true;
-
-    char ak[64], bk[64];
-    player_match_key(a, ak, sizeof(ak));
-    player_match_key(b, bk, sizeof(bk));
-    return ak[0] && bk[0] && strcmp(ak, bk) == 0;
-}
-
-static PlayerState *bus_find_by_stream_name(BusDaemon *b, const char *name) {
+static PlayerState *bus_find_by_pid(BusDaemon *b, pid_t pid) {
+    if (pid <= 0)
+        return NULL;
     for (int i = 0; i < b->n_players; i++) {
-        if (player_names_match(name, b->players[i].shortname))
+        if (b->players[i].pid == pid)
             return &b->players[i];
     }
     return NULL;
 }
 
-static void push_stream_player_event(const char *name, double volume, bool muted) {
+static void push_stream_player_event(pid_t pid, const char *name, double volume, bool muted) {
     char out_name[128] = {0};
     char title[256] = {0};
     char artist[256] = {0};
@@ -700,8 +645,8 @@ static void push_stream_player_event(const char *name, double volume, bool muted
     snprintf(out_name, sizeof(out_name), "%s", name && name[0] ? name : "player");
 
     pthread_mutex_lock(&g_bus_lock);
-    if (g_bus) {
-        PlayerState *p = bus_find_by_stream_name(g_bus, out_name);
+    if (g_bus && pid > 0) {
+        PlayerState *p = bus_find_by_pid(g_bus, pid);
         if (p) {
             snprintf(out_name, sizeof(out_name), "%s", p->shortname);
             snprintf(title, sizeof(title), "%s", p->title);
@@ -743,6 +688,18 @@ static void bus_resolve_unique(BusDaemon *b, PlayerState *p) {
     if (owner)
         snprintf(p->unique_name, sizeof(p->unique_name), "%s", owner);
     sd_bus_message_unref(reply);
+}
+
+static void bus_resolve_pid(BusDaemon *b, PlayerState *p) {
+    sd_bus_creds *creds = NULL;
+    pid_t pid = 0;
+    int r = sd_bus_get_name_creds(b->bus, p->busname, SD_BUS_CREDS_PID, &creds);
+    if (r < 0)
+        return;
+    r = sd_bus_creds_get_pid(creds, &pid);
+    sd_bus_creds_unref(creds);
+    if (r >= 0)
+        p->pid = pid;
 }
 
 static void bus_remove_player(BusDaemon *b, const char *busname) {
@@ -892,6 +849,7 @@ static int on_name_owner_changed(sd_bus_message *m, void *userdata, sd_bus_error
         PlayerState *p = bus_add_player(b, name);
         if (p) {
             bus_resolve_unique(b, p);
+            bus_resolve_pid(b, p);
             bus_fetch_player_state(b, p);
             bus_emit_player(b, p);
         }
