@@ -526,27 +526,12 @@ static void on_global_daemon(void *data, uint32_t id, uint32_t permissions, cons
         const char *app_name = spa_dict_lookup(props, PW_KEY_APP_NAME);
         const char *app_id = spa_dict_lookup(props, PW_KEY_APP_ID);
         const char *process_binary = spa_dict_lookup(props, PW_KEY_APP_PROCESS_BINARY);
-        if (app_name) {
-            size_t n = strlen(app_name);
-            if (n >= sizeof(client->app_name))
-                n = sizeof(client->app_name) - 1;
-            memmove(client->app_name, app_name, n);
-            client->app_name[n] = '\0';
-        }
-        if (app_id) {
-            size_t n = strlen(app_id);
-            if (n >= sizeof(client->app_id))
-                n = sizeof(client->app_id) - 1;
-            memmove(client->app_id, app_id, n);
-            client->app_id[n] = '\0';
-        }
-        if (process_binary) {
-            size_t n = strlen(process_binary);
-            if (n >= sizeof(client->process_binary))
-                n = sizeof(client->process_binary) - 1;
-            memmove(client->process_binary, process_binary, n);
-            client->process_binary[n] = '\0';
-        }
+        if (app_name)
+            strncpy(client->app_name, app_name, sizeof(client->app_name) - 1);
+        if (app_id)
+            strncpy(client->app_id, app_id, sizeof(client->app_id) - 1);
+        if (process_binary)
+            strncpy(client->process_binary, process_binary, sizeof(client->process_binary) - 1);
         return;
     }
 
@@ -568,11 +553,7 @@ static void on_global_daemon(void *data, uint32_t id, uint32_t permissions, cons
             stream->client_id = client_str ? (uint32_t)strtoul(client_str, NULL, 10) : 0;
 
             const char *s = node_name ? node_name : "player";
-            size_t n = strlen(s);
-            if (n >= sizeof(stream->node_name))
-                n = sizeof(stream->node_name) - 1;
-            memmove(stream->node_name, s, n);
-            stream->node_name[n] = '\0';
+            strncpy(stream->node_name, s, sizeof(stream->node_name) - 1);
 
             const char *pid_str = spa_dict_lookup(props, PW_KEY_APP_PROCESS_ID);
             stream->pid = pid_str ? (pid_t)strtol(pid_str, NULL, 10) : 0;
@@ -603,11 +584,7 @@ static void on_global_daemon(void *data, uint32_t id, uint32_t permissions, cons
         const char *dev_str = spa_dict_lookup(props, "device.id");
         sink->device_id = dev_str ? (uint32_t)strtoul(dev_str, NULL, 10) : 0;
 
-        size_t n = strlen(node_name);
-        if (n >= sizeof(sink->name))
-            n = sizeof(sink->name) - 1;
-        memmove(sink->name, node_name, n);
-        sink->name[n] = '\0';
+        strncpy(sink->name, node_name, sizeof(sink->name) - 1);
 
         sink->node = pw_registry_bind(d->registry, id, PW_TYPE_INTERFACE_Node, PW_VERSION_NODE, 0);
         if (sink->node)
@@ -1151,6 +1128,7 @@ int daemon_run(void) {
 
     signal(SIGTERM, on_signal);
     signal(SIGINT, on_signal);
+    signal(SIGQUIT, on_signal);
 
     fprintf(stderr, "nyq: daemon started\n");
 
