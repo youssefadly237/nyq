@@ -4,10 +4,10 @@ CFLAGS  = -Wall -Wextra -std=c11 -O2 -g \
           $(shell pkg-config --cflags libpipewire-0.3 libcjson)
 LDFLAGS = -lm \
           $(shell pkg-config --libs libpipewire-0.3 libcjson) \
-          -lsystemd
+          -lsystemd -lpthread
 
-SRC = main.c util.c pw.c mpris.c sock.c
-HDR = util.h pw.h mpris.h sock.h
+SRC = main.c util.c pw.c mpris.c sock.c daemon.c
+HDR = util.h pw.h mpris.h sock.h daemon.h
 OBJ = $(SRC:.c=.o)
 BIN = nyq
 FMT = clang-format

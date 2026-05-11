@@ -4,6 +4,7 @@
 
 #include "pw.h"
 #include "mpris.h"
+#include "daemon.h"
 #include "sock.h"
 
 static void usage(void) {
@@ -64,10 +65,8 @@ int main(int argc, char *argv[]) {
     const char *name = argc >= 3 ? argv[2] : NULL;
 
     /* daemon */
-    if (strcmp(cmd, "daemon") == 0) {
-        fprintf(stderr, "nyq: daemon not yet implemented\n");
-        return 1;
-    }
+    if (strcmp(cmd, "daemon") == 0)
+        return daemon_run();
 
     /* listen */
     if (strcmp(cmd, "listen") == 0)
