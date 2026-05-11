@@ -15,9 +15,7 @@
 #define DBUS_NAME "org.freedesktop.DBus"
 #define DBUS_PATH "/org/freedesktop/DBus"
 
-/* ------------------------------------------------------------------ */
-/* State file                                                           */
-/* ------------------------------------------------------------------ */
+/* State file */
 
 static const char *state_path(void) {
     static char path[256];
@@ -52,9 +50,7 @@ static void state_read(char *buf, int len) {
     fclose(f);
 }
 
-/* ------------------------------------------------------------------ */
-/* Resolve player name -> full bus name                                 */
-/* ------------------------------------------------------------------ */
+/* Resolve player name -> full bus name */
 
 static int resolve_player(sd_bus *bus, const char *name, char *buf, int len) {
     sd_bus_message *reply = NULL;
@@ -91,9 +87,7 @@ static int resolve_player(sd_bus *bus, const char *name, char *buf, int len) {
     return found ? 0 : -1;
 }
 
-/* ------------------------------------------------------------------ */
-/* List active players (Playing or Paused)                             */
-/* ------------------------------------------------------------------ */
+/* List active players (Playing or Paused) */
 
 typedef struct {
     char busname[128];
@@ -150,9 +144,7 @@ static int list_active_players(sd_bus *bus, PlayerEntry *out, int max) {
     return count;
 }
 
-/* ------------------------------------------------------------------ */
-/* Read player state                                                    */
-/* ------------------------------------------------------------------ */
+/* Read player state */
 
 typedef struct {
     char title[256];
@@ -260,9 +252,7 @@ out:
     return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* Emit helper                                                          */
-/* ------------------------------------------------------------------ */
+/* Emit helper */
 
 static void emit_state(sd_bus *bus, const char *busname, const char *shortname) {
     PlayerState state;
@@ -274,9 +264,7 @@ static void emit_state(sd_bus *bus, const char *busname, const char *shortname) 
     emit_player(STDOUT_FILENO, shortname, state.title, state.artist, state.status, state.volume);
 }
 
-/* ------------------------------------------------------------------ */
-/* Commands                                                             */
-/* ------------------------------------------------------------------ */
+/* Commands */
 
 typedef enum {
     MPRIS_CMD_STATUS,
@@ -408,9 +396,7 @@ static int mpris_oneshot_run(const char *name, MprisCmd cmd) {
     return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* Public API                                                           */
-/* ------------------------------------------------------------------ */
+/* Public API */
 
 int mpris_oneshot_status(const char *name) {
     return mpris_oneshot_run(name, MPRIS_CMD_STATUS);

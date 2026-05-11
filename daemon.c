@@ -23,9 +23,7 @@
 #include <systemd/sd-bus.h>
 #include <cJSON.h>
 
-/* ------------------------------------------------------------------ */
-/* Constants                                                            */
-/* ------------------------------------------------------------------ */
+/* Constants */
 
 #define MAX_SINKS 32
 #define MAX_STREAMS 64
@@ -44,9 +42,7 @@
 #define DBUS_NAME "org.freedesktop.DBus"
 #define DBUS_PATH "/org/freedesktop/DBus"
 
-/* ------------------------------------------------------------------ */
-/* Event queue (PW thread -> main thread)                               */
-/* ------------------------------------------------------------------ */
+/* Event queue (PW thread -> main thread) */
 
 typedef struct {
     char json[EVENT_JSON_SIZE];
@@ -82,9 +78,7 @@ static int eq_pop(char *out, int len) {
     return 1;
 }
 
-/* ------------------------------------------------------------------ */
-/* JSON helpers using cJSON                                             */
-/* ------------------------------------------------------------------ */
+/* JSON helpers using cJSON */
 
 /* Serialize a cJSON object to a newline-terminated string and push
  * it onto the event queue. Frees root. */
@@ -143,9 +137,7 @@ static void push_player_event(const char *shortname, const char *title, const ch
     push_player_event_full(shortname, title, artist, status, volume, false, false);
 }
 
-/* ------------------------------------------------------------------ */
-/* PipeWire daemon state                                                */
-/* ------------------------------------------------------------------ */
+/* PipeWire daemon state */
 
 typedef struct {
     uint32_t id;
@@ -209,9 +201,7 @@ typedef struct {
 
 static PwDaemon *g_pw = NULL;
 
-/* ------------------------------------------------------------------ */
-/* Forward declarations                                                 */
-/* ------------------------------------------------------------------ */
+/* Forward declarations */
 
 static void pw_bind_sink_device(PwDaemon *d, DaemonSink *sink);
 static void pw_subscribe_sink(DaemonSink *sink);
@@ -289,9 +279,7 @@ static void pw_update_stream_name(PwDaemon *d, DaemonStream *stream, const struc
     normalize_player_name(src, stream->name, sizeof(stream->name));
 }
 
-/* ------------------------------------------------------------------ */
-/* Device param callback                                                */
-/* ------------------------------------------------------------------ */
+/* Device param callback */
 
 static void on_device_param_daemon(void *data, int seq, uint32_t id, uint32_t index, uint32_t next,
                                    const struct spa_pod *param) {
@@ -323,9 +311,7 @@ static const struct pw_device_events device_events_daemon = {
     .param = on_device_param_daemon,
 };
 
-/* ------------------------------------------------------------------ */
-/* Node param callback                                                  */
-/* ------------------------------------------------------------------ */
+/* Node param callback */
 
 static void on_node_param_daemon(void *data, int seq, uint32_t id, uint32_t index, uint32_t next,
                                  const struct spa_pod *param) {
@@ -425,9 +411,7 @@ static const struct pw_node_events stream_node_events_daemon = {
     .param = on_stream_param_daemon,
 };
 
-/* ------------------------------------------------------------------ */
-/* Metadata callback                                                    */
-/* ------------------------------------------------------------------ */
+/* Metadata callback */
 
 static int on_metadata_property_daemon(void *data, uint32_t subject, const char *key,
                                        const char *type, const char *value) {
@@ -464,9 +448,7 @@ static const struct pw_metadata_events metadata_events_daemon = {
     .property = on_metadata_property_daemon,
 };
 
-/* ------------------------------------------------------------------ */
-/* Registry callbacks                                                   */
-/* ------------------------------------------------------------------ */
+/* Registry callbacks */
 
 static void pw_subscribe_sink(DaemonSink *sink) {
     if (sink->subscribed || !sink->node)
@@ -639,9 +621,7 @@ static const struct pw_registry_events registry_events_daemon = {
     .global_remove = on_global_remove_daemon,
 };
 
-/* ------------------------------------------------------------------ */
-/* MPRIS / D-Bus state                                                  */
-/* ------------------------------------------------------------------ */
+/* MPRIS / D-Bus state */
 
 typedef struct {
     char busname[128];
@@ -667,9 +647,7 @@ typedef struct BusDaemon {
 static BusDaemon *g_bus = NULL;
 static pthread_mutex_t g_bus_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* ------------------------------------------------------------------ */
-/* Player helpers                                                       */
-/* ------------------------------------------------------------------ */
+/* Player helpers */
 
 static PlayerState *bus_find_by_unique(BusDaemon *b, const char *unique) {
     for (int i = 0; i < b->n_players; i++)
@@ -784,9 +762,7 @@ static void bus_emit_player(BusDaemon *b, PlayerState *p) {
     notify_main_thread(b->wakeup_fd);
 }
 
-/* ------------------------------------------------------------------ */
-/* Fetch player state from D-Bus                                        */
-/* ------------------------------------------------------------------ */
+/* Fetch player state from D-Bus */
 
 static void bus_fetch_player_state(BusDaemon *b, PlayerState *p) {
     sd_bus_message *reply = NULL;
@@ -873,9 +849,7 @@ out2:
     sd_bus_message_unref(reply);
 }
 
-/* ------------------------------------------------------------------ */
-/* D-Bus signal handlers                                                */
-/* ------------------------------------------------------------------ */
+/* D-Bus signal handlers */
 
 static int on_properties_changed(sd_bus_message *m, void *userdata, sd_bus_error *err) {
     BusDaemon *b = userdata;
@@ -928,9 +902,7 @@ static int on_name_owner_changed(sd_bus_message *m, void *userdata, sd_bus_error
     return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* Discover existing players at startup                                 */
-/* ------------------------------------------------------------------ */
+/* Discover existing players at startup */
 
 static void bus_discover_players(BusDaemon *b) {
     sd_bus_message *reply = NULL;
@@ -981,9 +953,7 @@ static void bus_discover_players(BusDaemon *b) {
     sd_bus_message_unref(reply);
 }
 
-/* ------------------------------------------------------------------ */
-/* Signal handling                                                      */
-/* ------------------------------------------------------------------ */
+/* Signal handling */
 
 static volatile int g_running = 1;
 
@@ -992,9 +962,7 @@ static void on_signal(int sig) {
     g_running = 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* Main daemon loop                                                     */
-/* ------------------------------------------------------------------ */
+/* Main daemon loop */
 
 int daemon_run(void) {
     int wakeup[2];

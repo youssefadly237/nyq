@@ -14,7 +14,7 @@
 int sock_server_init(void);
 
 /* Accept a pending connection. Returns client fd or -1 if none ready.
- * Non-blocking — call only when poll/epoll says the server fd is readable. */
+ * Non-blocking - call only when poll/epoll says the server fd is readable. */
 int sock_server_accept(int server_fd);
 
 /* Broadcast a newline-terminated JSON string to all connected clients.

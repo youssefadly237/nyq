@@ -10,12 +10,10 @@
 
 #include <cJSON.h>
 
-/* ------------------------------------------------------------------ */
-/* Socket path                                                          */
-/* ------------------------------------------------------------------ */
+/* Socket path */
 
 static const char *sock_path(void) {
-    /* sun_path is 108 bytes on Linux — cap path to fit */
+    /* sun_path is 108 bytes on Linux - cap path to fit */
     static char path[108];
     if (path[0])
         return path;
@@ -27,9 +25,7 @@ static const char *sock_path(void) {
     return path;
 }
 
-/* ------------------------------------------------------------------ */
-/* Server                                                               */
-/* ------------------------------------------------------------------ */
+/* Server */
 
 int sock_server_init(void) {
     const char *path = sock_path();
@@ -81,20 +77,18 @@ void sock_broadcast(int *clients, int *n_clients, const char *json) {
         ssize_t w = write(fd, json, len);
 
         if (w < 0) {
-            /* client disconnected — remove from list */
+            /* client disconnected - remove from list */
             close(fd);
             clients[i] = clients[*n_clients - 1];
             (*n_clients)--;
-            /* do not increment i — recheck this slot */
+            /* do not increment i - recheck this slot */
         } else {
             i++;
         }
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Client                                                               */
-/* ------------------------------------------------------------------ */
+/* Client */
 
 int sock_client_connect(void) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);

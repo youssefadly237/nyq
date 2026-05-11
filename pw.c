@@ -17,9 +17,7 @@
 
 #include <cJSON.h>
 
-/* ------------------------------------------------------------------ */
-/* Sink registry                                                        */
-/* ------------------------------------------------------------------ */
+/* Sink registry */
 
 #define MAX_SINKS 32
 
@@ -29,9 +27,7 @@ typedef struct {
     char name[256];
 } SinkEntry;
 
-/* ------------------------------------------------------------------ */
-/* State                                                                */
-/* ------------------------------------------------------------------ */
+/* State */
 
 typedef enum {
     PHASE_WAIT_GLOBALS,  /* initial registry burst + metadata properties */
@@ -88,18 +84,14 @@ typedef struct {
     int error;
 } PwState;
 
-/* ------------------------------------------------------------------ */
-/* Forward declarations                                                 */
-/* ------------------------------------------------------------------ */
+/* Forward declarations */
 
 static void start_bind(PwState *s);
 static void start_routes(PwState *s);
 static void start_params(PwState *s);
 static void finish(PwState *s);
 
-/* ------------------------------------------------------------------ */
-/* Core events                                                          */
-/* ------------------------------------------------------------------ */
+/* Core events */
 
 static void on_core_done(void *data, uint32_t id, int seq) {
     PwState *s = data;
@@ -125,7 +117,7 @@ static void on_core_done(void *data, uint32_t id, int seq) {
         start_params(s);
         break;
     case PHASE_WAIT_PARAMS:
-        /* no Props param arrived — finish with level=0 */
+        /* no Props param arrived - finish with level=0 */
         finish(s);
         break;
     default:
@@ -146,9 +138,7 @@ static const struct pw_core_events core_events = {
     .error = on_core_error,
 };
 
-/* ------------------------------------------------------------------ */
-/* Metadata events                                                      */
-/* ------------------------------------------------------------------ */
+/* Metadata events */
 
 static int on_metadata_property(void *data, uint32_t subject, const char *key, const char *type,
                                 const char *value) {
@@ -167,9 +157,7 @@ static const struct pw_metadata_events metadata_events = {
     .property = on_metadata_property,
 };
 
-/* ------------------------------------------------------------------ */
-/* Device param event — read Route index + card device                 */
-/* ------------------------------------------------------------------ */
+/* Device param event - read Route index + card device */
 
 static void on_device_param(void *data, int seq, uint32_t id, uint32_t index, uint32_t next,
                             const struct spa_pod *param) {
@@ -198,9 +186,7 @@ static const struct pw_device_events device_events = {
     .param = on_device_param,
 };
 
-/* ------------------------------------------------------------------ */
-/* Node param event                                                     */
-/* ------------------------------------------------------------------ */
+/* Node param event */
 
 static void on_node_param(void *data, int seq, uint32_t id, uint32_t index, uint32_t next,
                           const struct spa_pod *param) {
@@ -235,9 +221,7 @@ static const struct pw_node_events node_events = {
     .param = on_node_param,
 };
 
-/* ------------------------------------------------------------------ */
-/* Registry events                                                      */
-/* ------------------------------------------------------------------ */
+/* Registry events */
 
 static void on_global(void *data, uint32_t id, uint32_t permissions, const char *type,
                       uint32_t version, const struct spa_dict *props) {
@@ -288,9 +272,7 @@ static const struct pw_registry_events registry_events = {
     .global_remove = on_global_remove,
 };
 
-/* ------------------------------------------------------------------ */
-/* Phase transitions                                                    */
-/* ------------------------------------------------------------------ */
+/* Phase transitions */
 
 static void start_bind(PwState *s) {
     if (!s->metadata) {
@@ -306,7 +288,6 @@ static void start_bind(PwState *s) {
         return;
     }
 
-    /* resolve target_id from target_name */
     s->target_id = 0;
     for (int i = 0; i < s->n_sinks; i++) {
         if (strcmp(s->sinks[i].name, s->target_name) == 0) {
@@ -360,9 +341,7 @@ static void start_params(PwState *s) {
     s->sync_seq = pw_core_sync(s->core, PW_ID_CORE, 0);
 }
 
-/* ------------------------------------------------------------------ */
-/* Sink cycling                                                          */
-/* ------------------------------------------------------------------ */
+/* Sink cycling */
 
 static void do_sink_cycle(PwState *s, int dir) {
     if (s->n_sinks == 0) {
@@ -372,7 +351,6 @@ static void do_sink_cycle(PwState *s, int dir) {
         return;
     }
 
-    /* find current default in sink list */
     int cur = 0;
     for (int i = 0; i < s->n_sinks; i++) {
         if (strcmp(s->sinks[i].name, s->target_name) == 0) {
@@ -411,9 +389,7 @@ static void do_sink_cycle(PwState *s, int dir) {
     pw_main_loop_quit(s->loop);
 }
 
-/* ------------------------------------------------------------------ */
-/* Route set helper — mirrors pulse-server exactly                      */
-/* ------------------------------------------------------------------ */
+/* Route set helper - mirrors pulse-server exactly */
 
 static void set_via_route(PwState *s, const float *vols, uint32_t n_ch, bool mute, bool set_vol,
                           bool set_mute) {
@@ -443,9 +419,7 @@ static void set_via_route(PwState *s, const float *vols, uint32_t n_ch, bool mut
     pw_device_set_param(s->device, SPA_PARAM_Route, 0, param);
 }
 
-/* ------------------------------------------------------------------ */
-/* Finish                                                               */
-/* ------------------------------------------------------------------ */
+/* Finish */
 
 static void finish(PwState *s) {
     if (s->cmd == PW_CMD_SINK_NEXT) {
@@ -499,9 +473,7 @@ static void finish(PwState *s) {
     pw_main_loop_quit(s->loop);
 }
 
-/* ------------------------------------------------------------------ */
-/* Entry point                                                          */
-/* ------------------------------------------------------------------ */
+/* Entry point */
 
 static int pw_oneshot_run(PwCmd cmd) {
     PwState s = {0};
@@ -566,9 +538,7 @@ cleanup:
     return s.error;
 }
 
-/* ------------------------------------------------------------------ */
-/* Public API                                                           */
-/* ------------------------------------------------------------------ */
+/* Public API */
 
 int pw_oneshot_status(void) {
     return pw_oneshot_run(PW_CMD_STATUS);
