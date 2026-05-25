@@ -45,12 +45,12 @@ float volume_step(float level, int delta) {
 
 const char *volume_icon(float level, bool muted) {
     if (muted || level == 0.0f)
-        return "audio-volume-muted";
+        return "";
     if (level < 0.33f)
-        return "audio-volume-low";
+        return "";
     if (level < 0.66f)
-        return "audio-volume-medium";
-    return "audio-volume-high";
+        return "";
+    return "";
 }
 
 int parse_name_json(const char *json, char *buf, int len) {
