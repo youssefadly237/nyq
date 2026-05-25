@@ -144,6 +144,14 @@ static void push_player_event(const char *shortname, const char *title, const ch
     push_player_event_full(shortname, title, artist, status, volume, false, false);
 }
 
+static void push_stream_event(const char *name, const char *event) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "stream");
+    cJSON_AddStringToObject(root, "name", name ? name : "");
+    cJSON_AddStringToObject(root, "event", event);
+    eq_push_json(root);
+}
+
 /* PipeWire daemon state */
 
 typedef struct {
@@ -573,6 +581,8 @@ static void on_global_daemon(void *data, uint32_t id, uint32_t permissions, cons
                                      &stream_node_events_daemon, stream);
 
             pw_subscribe_stream(stream);
+            push_stream_event(stream->name, "added");
+            notify_main_thread(d->wakeup_fd);
             return;
         }
 
@@ -621,6 +631,8 @@ static void on_global_remove_daemon(void *data, uint32_t id) {
 
     for (int i = 0; i < d->n_streams; i++) {
         if (d->streams[i].id == id) {
+            push_stream_event(d->streams[i].name, "removed");
+            notify_main_thread(d->wakeup_fd);
             if (d->streams[i].node) {
                 spa_hook_remove(&d->streams[i].node_listener);
                 pw_proxy_destroy((struct pw_proxy *)d->streams[i].node);
@@ -1184,6 +1196,27 @@ int daemon_run(void) {
                         cJSON_AddBoolToObject(root, "muted", sk->muted);
                         cJSON_AddStringToObject(root, "icon", volume_icon(sk->level, sk->muted));
                         cJSON_AddBoolToObject(root, "default", is_def);
+                        char *str = cJSON_PrintUnformatted(root);
+                        cJSON_Delete(root);
+                        if (str) {
+                            char line[EVENT_JSON_SIZE];
+                            snprintf(line, sizeof(line), "%s\n", str);
+                            cJSON_free(str);
+                            int tmp_c[] = {cfd};
+                            int tmp_n = 1;
+                            sock_broadcast(tmp_c, &tmp_n, line);
+                        }
+                    }
+                    for (int j = 0; j < pw.n_streams; j++) {
+                        DaemonStream *st = &pw.streams[j];
+                        cJSON *root = cJSON_CreateObject();
+                        cJSON_AddStringToObject(root, "type", "stream");
+                        cJSON_AddStringToObject(root, "name", st->name);
+                        cJSON_AddStringToObject(root, "event", "added");
+                        if (st->title[0])
+                            cJSON_AddStringToObject(root, "title", st->title);
+                        if (st->artist[0])
+                            cJSON_AddStringToObject(root, "artist", st->artist);
                         char *str = cJSON_PrintUnformatted(root);
                         cJSON_Delete(root);
                         if (str) {
