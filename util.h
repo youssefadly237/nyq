@@ -7,6 +7,8 @@
 #include <unistd.h>
 #include <errno.h>
 
+#include <cJSON.h>
+
 #include <systemd/sd-journal.h>
 #include <syslog.h>
 
@@ -44,12 +46,19 @@ const char *volume_icon(float level, bool muted);
 /* Parse {"name":"..."} -> writes into buf (max len), returns 0 on success */
 int parse_name_json(const char *json, char *buf, int len);
 
-/* Emit sink event JSON to fd (pass 1 for stdout) */
+/* Emit sink event JSON to fd */
 void emit_sink(int fd, float level, bool muted);
+
+/* Emit sink list JSON (type: sink-list, array of {name, level, muted, icon, default}) */
+void emit_sink_list(int fd, cJSON *sinks);
 
 /* Emit player event JSON to fd */
 void emit_player(int fd, const char *name, const char *title, const char *artist,
                  const char *status, double volume);
+
+/* Emit player list JSON (type: player-list, array of {name, title, artist, status, volume,
+ * focused}) */
+void emit_player_list(int fd, cJSON *players);
 
 /* Bounded string copy: copies src into dst (dst_size bytes), always null-terminates.
  * Returns dst. No-op if dst_size is 0. */

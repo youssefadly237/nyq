@@ -92,6 +92,14 @@ void emit_sink(int fd, float level, bool muted) {
     cJSON_Delete(root);
 }
 
+void emit_sink_list(int fd, cJSON *sinks) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "sink-list");
+    cJSON_AddItemToObject(root, "sinks", sinks);
+    emit_json(fd, root);
+    cJSON_Delete(root);
+}
+
 void emit_player(int fd, const char *name, const char *title, const char *artist,
                  const char *status, double volume) {
     cJSON *root = cJSON_CreateObject();
@@ -102,6 +110,14 @@ void emit_player(int fd, const char *name, const char *title, const char *artist
     cJSON_AddStringToObject(root, "status", status ? status : "Stopped");
     cJSON_AddNumberToObject(root, "volume", volume);
 
+    emit_json(fd, root);
+    cJSON_Delete(root);
+}
+
+void emit_player_list(int fd, cJSON *players) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "player-list");
+    cJSON_AddItemToObject(root, "players", players);
     emit_json(fd, root);
     cJSON_Delete(root);
 }

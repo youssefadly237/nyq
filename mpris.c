@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <stdlib.h>
 
+#include <cJSON.h>
 #include <systemd/sd-bus.h>
 
 #define MPRIS_PREFIX "org.mpris.MediaPlayer2."
@@ -324,6 +325,35 @@ static int mpris_oneshot_run(const char *name, MprisCmd cmd) {
 
         state_write(players[next_idx].shortname);
         emit_state(bus, players[next_idx].busname, players[next_idx].shortname);
+        sd_bus_unref(bus);
+        return 0;
+    }
+
+    /* status: list all active players with focused flag */
+    if (cmd == MPRIS_CMD_STATUS) {
+        PlayerEntry players[16];
+        int n = list_active_players(bus, players, 16);
+
+        char focused[64] = {0};
+        state_read(focused, sizeof(focused));
+
+        cJSON *arr = cJSON_CreateArray();
+        for (int i = 0; i < n; i++) {
+            PlayerState state;
+            read_player_state(bus, players[i].busname, &state);
+            read_metadata(bus, players[i].busname, &state);
+
+            cJSON *item = cJSON_CreateObject();
+            cJSON_AddStringToObject(item, "name", players[i].shortname);
+            cJSON_AddStringToObject(item, "title", state.title);
+            cJSON_AddStringToObject(item, "artist", state.artist);
+            cJSON_AddStringToObject(item, "status", state.status);
+            cJSON_AddNumberToObject(item, "volume", state.volume);
+            cJSON_AddBoolToObject(item, "focused", strcmp(players[i].shortname, focused) == 0);
+            cJSON_AddItemToArray(arr, item);
+        }
+
+        emit_player_list(STDOUT_FILENO, arr);
         sd_bus_unref(bus);
         return 0;
     }
